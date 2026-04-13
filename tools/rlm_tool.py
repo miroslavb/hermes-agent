@@ -15,10 +15,42 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 
 from tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# API key resolution
+# =============================================================================
+
+def _resolve_nous_api_key() -> str | None:
+    """Read the Nous agent key from auth.json (minted by portal OAuth)."""
+    auth_path = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "auth.json"
+    if not auth_path.exists():
+        return None
+    try:
+        with open(auth_path) as f:
+            auth = json.load(f)
+        return auth.get("providers", {}).get("nous", {}).get("agent_key")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _resolve_api_key(base_url: str | None) -> str | None:
+    """Resolve the API key for the given endpoint."""
+    if base_url is None or "nousresearch" in str(base_url):
+        # Nous portal auth
+        key = _resolve_nous_api_key()
+        if key:
+            return key
+        # Fallback to env var
+        return os.environ.get("NOUS_API_KEY")
+    elif "openrouter" in str(base_url):
+        return os.environ.get("OPENROUTER_API_KEY")
+    return None
 
 
 # =============================================================================
@@ -44,10 +76,13 @@ def check_rlm_requirements() -> bool:
         from rlm import RLM  # noqa: F401
     except ImportError:
         return False
-    # Need at least one API key
-    if not os.environ.get("NOUS_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
-        return False
-    return True
+    # Check for Nous agent key in auth.json
+    if _resolve_nous_api_key():
+        return True
+    # Check env vars
+    if os.environ.get("NOUS_API_KEY") or os.environ.get("OPENROUTER_API_KEY"):
+        return True
+    return False
 
 
 # =============================================================================
@@ -94,6 +129,11 @@ def rlm_repl_tool(args: dict, **kwargs) -> str:
     backend_kwargs = {"model_name": model}
     if base_url:
         backend_kwargs["base_url"] = base_url
+
+    # Resolve API key from auth.json or env vars
+    api_key = _resolve_api_key(base_url)
+    if api_key:
+        backend_kwargs["api_key"] = api_key
 
     try:
         rlm_instance = RLM(
