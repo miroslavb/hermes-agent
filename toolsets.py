@@ -54,6 +54,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # RLM REPL
+    "rlm_repl",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -183,6 +185,12 @@ TOOLSETS = {
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],
+        "includes": []
+    },
+
+    "rlm_repl": {
+        "description": "Run Recursive Language Model (RLM) completions with iterative code execution and recursive sub-calls",
+        "tools": ["rlm_repl"],
         "includes": []
     },
     
