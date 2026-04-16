@@ -524,7 +524,8 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
-    
+    _session_modes: Dict[str, str] = {}  # Per-session response mode: auto/rlm/code
+
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
@@ -580,6 +581,7 @@ class GatewayRunner:
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._session_modes: Dict[str, str] = {}
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
@@ -2623,6 +2625,9 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "mode":
+            return await self._handle_mode_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -3592,11 +3597,26 @@ class GatewayRunner:
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
-            # compression decisions.
+            # compression decisions. Also accumulate total_tokens for /status.
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                total_tokens=(agent_result.get("input_tokens", 0) or 0) + (agent_result.get("output_tokens", 0) or 0),
             )
+
+            # Also update token counts in state.db for dashboard visibility
+            if self._session_db and session_entry.session_id:
+                try:
+                    self._session_db.update_token_counts(
+                        session_entry.session_id,
+                        input_tokens=agent_result.get("input_tokens", 0) or 0,
+                        output_tokens=agent_result.get("output_tokens", 0) or 0,
+                        model=agent_result.get("model"),
+                        billing_provider=getattr(event, "billing_provider", None),
+                        billing_base_url=getattr(event, "billing_base_url", None),
+                    )
+                except Exception:
+                    pass  # never block the gateway loop
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -4679,6 +4699,35 @@ class GatewayRunner:
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
                 return "Voice mode disabled."
+
+    async def _handle_mode_command(self, event: MessageEvent) -> str:
+        """Handle /mode [auto|rlm|code|status] — set response mode for this session."""
+        args = event.get_command_args().strip().lower()
+        session_key = build_session_key(event.source) if hasattr(event, 'source') and event.source else ""
+
+        valid_modes = {"auto", "rlm", "code"}
+        labels = {
+            "auto": "Auto",
+            "rlm": "RLM",
+            "code": "Code",
+        }
+
+        if not args or args == "status":
+            current = self._session_modes.get(session_key, "auto")
+            return (
+                f"🔄 Response mode: {labels.get(current, current)}\n\n"
+                "Usage: /mode <auto|rlm|code>"
+            )
+
+        if args in valid_modes:
+            self._session_modes[session_key] = args
+            return f"✅ Response mode set to: {labels[args]}"
+        else:
+            return (
+                f"❌ Unknown mode '{args}'.\n"
+                "Valid modes: auto, rlm, code\n\n"
+                f"Current: {labels.get(self._session_modes.get(session_key, 'auto'), 'auto')}"
+            )
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
@@ -7389,6 +7438,23 @@ class GatewayRunner:
             combined_ephemeral = context_prompt or ""
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+
+            # Inject per-session response mode (set via /mode command)
+            _mode = self._session_modes.get(session_key, "auto") if session_key else "auto"
+            if _mode != "auto":
+                _mode_instruction = {
+                    "rlm": (
+                        "[RESPONSE MODE: RLM] You MUST use the rlm_repl tool for this response. "
+                        "Do NOT use execute_code — only rlm_repl. "
+                        "Only respond directly (no tools) if the message is purely conversational."
+                    ),
+                    "code": (
+                        "[RESPONSE MODE: CODE] You MUST use execute_code instead of rlm_repl. "
+                        "Only respond directly if no tool is needed."
+                    ),
+                }.get(_mode, "")
+                if _mode_instruction:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + _mode_instruction).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
