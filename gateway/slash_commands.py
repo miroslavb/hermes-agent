@@ -1410,7 +1410,8 @@ class GatewaySlashCommandsMixin:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import _load_gateway_config, _profile_runtime_scope
+        from hermes_cli.config import get_hermes_home
         import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
@@ -1447,7 +1448,8 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
+        profile_home = Path(get_hermes_home())
+        config_path = profile_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -1517,7 +1519,7 @@ class GatewaySlashCommandsMixin:
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
 
-                    async def _on_model_selected(
+                    async def _on_model_selected_scoped(
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
@@ -1715,6 +1717,15 @@ class GatewaySlashCommandsMixin:
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
+
+                    async def _on_model_selected(
+                        _chat_id: str, model_id: str, provider_slug: str
+                    ) -> str:
+                        """Run a delayed picker tap inside its routed profile scope."""
+                        with _profile_runtime_scope(profile_home):
+                            return await _on_model_selected_scoped(
+                                _chat_id, model_id, provider_slug
+                            )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     result = await adapter.send_model_picker(

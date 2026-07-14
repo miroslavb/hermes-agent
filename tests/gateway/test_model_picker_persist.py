@@ -201,3 +201,115 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
     assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_callback_reenters_profile_scope_for_delayed_tap(
+    tmp_path, monkeypatch
+):
+    """A delayed picker tap must resolve credentials from the routed profile.
+
+    The picker callback fires after the original ``/model`` turn has left its
+    multiplex runtime scope.  Credential resolution inside that callback (and
+    its worker thread) must still see the same profile's ``.env`` rather than
+    failing closed or inheriting another profile's key.
+    """
+    from agent import secret_scope as ss
+    from gateway.run import _profile_runtime_scope
+
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    profile_home = cfg_path.parent
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=sk-profile-openai\n",
+        encoding="utf-8",
+    )
+
+    seen = {}
+
+    def scoped_switch(**kwargs):
+        seen["openai_key"] = ss.get_secret("OPENAI_API_KEY")
+        seen["home"] = str(profile_home)
+        return _fake_switch_result()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", scoped_switch)
+    runner = _make_runner(adapter)
+    event = _make_event("/model")
+
+    ss.set_multiplex_active(True)
+    try:
+        with _profile_runtime_scope(profile_home):
+            sent = await runner._handle_model_command(event)
+        assert sent is None
+        assert adapter.captured_callback is not None
+        assert ss.current_secret_scope() is None
+
+        confirmation = await adapter.captured_callback(
+            "12345", "gpt-5.5", "openrouter"
+        )
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert "gpt-5.5" in confirmation
+    assert seen == {
+        "openai_key": "sk-profile-openai",
+        "home": str(profile_home),
+    }
+    assert ss.current_secret_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_picker_callback_persists_to_routed_profile_config(
+    tmp_path, monkeypatch
+):
+    """A multiplex picker tap must read and write the routed profile config."""
+    import gateway.run as gateway_run
+    from agent import secret_scope as ss
+    from gateway.run import _profile_runtime_scope
+
+    adapter = _FakePickerAdapter()
+    profile_cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "profile-old", "provider": "openrouter"},
+    )
+    profile_home = profile_cfg_path.parent
+    profile_cfg = yaml.safe_load(profile_cfg_path.read_text(encoding="utf-8"))
+    profile_cfg["profile_marker"] = "routed-profile"
+    profile_cfg_path.write_text(yaml.safe_dump(profile_cfg), encoding="utf-8")
+
+    gateway_home = tmp_path / "gateway-root"
+    gateway_home.mkdir()
+    gateway_cfg_path = gateway_home / "config.yaml"
+    gateway_cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"default": "gateway-old", "provider": "nous"},
+                "profile_marker": "gateway-root",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", gateway_home)
+
+    runner = _make_runner(adapter)
+    ss.set_multiplex_active(True)
+    try:
+        with _profile_runtime_scope(profile_home):
+            sent = await runner._handle_model_command(_make_event("/model"))
+        assert sent is None
+        assert adapter.captured_callback is not None
+        await adapter.captured_callback("12345", "gpt-5.5", "openrouter")
+    finally:
+        ss.set_multiplex_active(False)
+
+    routed = yaml.safe_load(profile_cfg_path.read_text(encoding="utf-8"))
+    gateway = yaml.safe_load(gateway_cfg_path.read_text(encoding="utf-8"))
+    assert routed["profile_marker"] == "routed-profile"
+    assert routed["model"]["default"] == "gpt-5.5"
+    assert gateway["profile_marker"] == "gateway-root"
+    assert gateway["model"]["default"] == "gateway-old"

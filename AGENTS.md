@@ -633,6 +633,16 @@ the env var in code (see `gateway_timeout`, `terminal.cwd` → `TERMINAL_CWD`).
 If you add a new key and the CLI sees it but the gateway doesn't (or vice
 versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
 
+### Multiplex callback scope
+
+Delayed gateway callbacks (inline keyboards, picker taps, deferred handlers)
+run after the inbound turn's ContextVars have been reset. Capture the routed
+profile home while handling the inbound event, then re-enter
+`_profile_runtime_scope(profile_home)` for the callback's full lifetime,
+including worker-thread calls. Resolve profile config paths through
+`get_hermes_home()` inside that scope; never use the gateway process's
+module-level `_hermes_home` for a routed profile write.
+
 ### Working directory:
 - **CLI** — uses the process's current directory (`os.getcwd()`).
 - **Messaging** — uses `terminal.cwd` from `config.yaml`. The gateway bridges this
