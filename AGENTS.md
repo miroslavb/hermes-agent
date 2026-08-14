@@ -1038,6 +1038,12 @@ Current toolset keys: `browser`, `clarify`, `code_execution`, `cronjob`,
 `messaging`, `moa`, `rl`, `safe`, `search`, `session_search`, `skills`,
 `spotify`, `terminal`, `todo`, `tts`, `video`, `vision`, `web`, `yuanbao`.
 
+Home Assistant response-data actions are part of the existing
+`ha_call_service` contract. When `ha_list_services` reports a `response`
+field (for example `weather.get_forecasts`), callers must set
+`return_response: true`; the tool preserves the returned payload as
+`response_data`.
+
 Enable/disable per platform via `hermes tools` (the curses UI) or the
 `tools.<platform>.enabled` / `tools.<platform>.disabled` lists in
 `config.yaml`.

@@ -160,6 +160,14 @@ def _parse_service_response(
     result: Any,
 ) -> Dict[str, Any]:
     """Parse HA service call response into a structured result."""
+    service_response = None
+    if isinstance(result, dict):
+        # ``?return_response`` wraps both changed states and the service's
+        # response payload.  Response-only actions such as
+        # weather.get_forecasts require this REST mode.
+        service_response = result.get("service_response")
+        result = result.get("changed_states", [])
+
     affected = []
     if isinstance(result, list):
         for s in result:
@@ -168,11 +176,14 @@ def _parse_service_response(
                 "state": s.get("state", ""),
             })
 
-    return {
+    parsed = {
         "success": True,
         "service": f"{domain}.{service}",
         "affected_entities": affected,
     }
+    if service_response is not None:
+        parsed["response_data"] = service_response
+    return parsed
 
 
 async def _async_call_service(
@@ -180,12 +191,15 @@ async def _async_call_service(
     service: str,
     entity_id: Optional[str] = None,
     data: Optional[Dict[str, Any]] = None,
+    return_response: bool = False,
 ) -> Dict[str, Any]:
     """Call a Home Assistant service."""
     import aiohttp
 
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/services/{domain}/{service}"
+    if return_response:
+        url += "?return_response"
     payload = _build_service_payload(entity_id, data)
 
     async with aiohttp.ClientSession() as session:
@@ -281,8 +295,20 @@ def _handle_call_service(args: dict, **kw) -> str:
         except json.JSONDecodeError as e:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
 
+    return_response = args.get("return_response", False)
+    if not isinstance(return_response, bool):
+        return tool_error("'return_response' must be a boolean")
+
     try:
-        result = _run_async(_async_call_service(domain, service, entity_id, data))
+        result = _run_async(
+            _async_call_service(
+                domain,
+                service,
+                entity_id,
+                data,
+                return_response,
+            )
+        )
         return json.dumps({"result": result})
     except Exception as e:
         logger.error("ha_call_service error: %s", e)
@@ -321,6 +347,12 @@ async def _async_list_services(domain: Optional[str] = None) -> Dict[str, Any]:
                     k: v.get("description", "") for k, v in fields.items()
                     if isinstance(v, dict)
                 }
+            response = svc_info.get("response")
+            if isinstance(response, dict):
+                # Preserve whether HA requires a response-data call.  Without
+                # this bit the model cannot know that actions such as
+                # weather.get_forecasts need ``return_response=true``.
+                svc_entry["response"] = response
             domain_services[svc_name] = svc_entry
         result.append({"domain": d, "services": domain_services})
 
@@ -463,6 +495,15 @@ HA_CALL_SERVICE_SCHEMA = {
                     '{"brightness": 255, "color_name": "blue"} for lights, '
                     '{"temperature": 22, "hvac_mode": "heat"} for climate, '
                     '{"volume_level": 0.5} for media players.'
+                ),
+            },
+            "return_response": {
+                "type": "boolean",
+                "description": (
+                    "Request service response data. Set true when "
+                    "ha_list_services reports a response field, including "
+                    "weather.get_forecasts; required response-data services "
+                    "fail if this is omitted."
                 ),
             },
         },

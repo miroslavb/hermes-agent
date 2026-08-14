@@ -107,6 +107,22 @@ class TestParseServiceResponse:
         result = _parse_service_response("climate", "set_temperature", [])
         assert result["service"] == "climate.set_temperature"
 
+    def test_response_data_is_preserved(self):
+        result = _parse_service_response(
+            "weather",
+            "get_forecasts",
+            {
+                "changed_states": [],
+                "service_response": {
+                    "weather.home": {"forecast": [{"temperature": 25.7}]}
+                },
+            },
+        )
+        assert result["affected_entities"] == []
+        assert result["response_data"]["weather.home"]["forecast"][0] == {
+            "temperature": 25.7
+        }
+
 
 # ---------------------------------------------------------------------------
 # Handler validation (no mocks - these paths don't reach the network)
@@ -154,6 +170,7 @@ class TestDomainBlocklist:
             "turn_on",
             "light.test",
             None,
+            False,
         )
 
     def test_blocked_domains_include_shell_command(self):
@@ -196,7 +213,39 @@ class TestEntityIdValidation:
             "turn_on",
             None,
             None,
+            False,
         )
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_response_data_mode_is_forwarded(self, mock_call_service):
+        mock_call_service.return_value = {
+            "success": True,
+            "response_data": {"weather.home": {"forecast": []}},
+        }
+        result = json.loads(_handle_call_service({
+            "domain": "weather",
+            "service": "get_forecasts",
+            "entity_id": "weather.home",
+            "data": '{"type": "daily"}',
+            "return_response": True,
+        }))
+        assert result["result"]["success"] is True
+        mock_call_service.assert_awaited_once_with(
+            "weather",
+            "get_forecasts",
+            "weather.home",
+            {"type": "daily"},
+            True,
+        )
+
+    def test_response_data_mode_rejects_non_boolean(self):
+        result = json.loads(_handle_call_service({
+            "domain": "weather",
+            "service": "get_forecasts",
+            "return_response": "true",
+        }))
+        assert "error" in result
+        assert "boolean" in result["error"]
 
 
 # ---------------------------------------------------------------------------
