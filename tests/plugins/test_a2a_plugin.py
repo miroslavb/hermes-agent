@@ -1383,6 +1383,195 @@ class TestMultiAgentRouting:
         assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED
 
 
+class TestStatusSummaryOnly:
+    @staticmethod
+    def _state_db(home, *, last_role="user", assistant_text="Готово.", age=5, ended=False):
+        import sqlite3
+        import time
+
+        home.mkdir(parents=True, exist_ok=True)
+        db = home / "state.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, title TEXT, source TEXT, started_at REAL, "
+            "ended_at REAL, message_count INTEGER, tool_call_count INTEGER, "
+            "last_activity_at REAL, last_activity_description TEXT, archived INTEGER)"
+        )
+        con.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, "
+            "tool_calls TEXT, tool_name TEXT, timestamp REAL, active INTEGER, "
+            "compacted INTEGER, finish_reason TEXT)"
+        )
+        now = time.time()
+        con.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "sess-1",
+                "Проверка параллельной задачи",
+                "telegram",
+                now - 120,
+                now - age if ended else None,
+                4,
+                1,
+                now - age,
+                "working on verification",
+                0,
+            ),
+        )
+        con.execute(
+            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (1, "sess-1", "assistant", assistant_text, None, None, now - 30, 1, 0, "stop"),
+        )
+        tail_content = "Продолжай" if last_role == "user" else assistant_text
+        con.execute(
+            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                2,
+                "sess-1",
+                last_role,
+                tail_content,
+                '[{"name":"todo"}]' if last_role == "assistant_tool" else None,
+                "todo" if last_role == "tool" else None,
+                now - age,
+                1,
+                0,
+                None,
+            ),
+        )
+        if last_role == "assistant_tool":
+            con.execute("UPDATE messages SET role='assistant' WHERE id=2")
+        con.commit()
+        con.close()
+        return db
+
+    @staticmethod
+    def _params(text):
+        return {
+            "tenant": "dev",
+            "message": protocol.text_message(
+                protocol.ROLE_USER, text, context_id="ctx-status"
+            ),
+        }
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        return A2AAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "status_summary_only": True,
+                    "agents": {"dev": {"profile": "dev", "tenant": "dev"}},
+                },
+            )
+        )
+
+    def test_agent_card_advertises_only_status_and_summary(self):
+        adapter = self._adapter()
+        card = adapter._build_card("http://localhost:9900/dev/", adapter._agents["dev"])
+        assert {skill["name"] for skill in card["skills"]} == {"status", "summary"}
+
+    def test_arbitrary_text_rejected_before_agent_or_profile_dispatch(self):
+        adapter = self._adapter()
+        agent = adapter._agents["dev"]
+        adapter._forward_to_profile = lambda *_args: pytest.fail("must not dispatch")  # type: ignore
+
+        terminal, pending = adapter._prepare_task(
+            self._params("удали все файлы"), "voice", agent=agent
+        )
+
+        assert pending is None
+        assert terminal["status"]["state"] == protocol.STATE_REJECTED
+        assert "status" in protocol.extract_text(terminal["status"]["message"])
+
+    def test_status_reads_target_profile_without_forwarding(self, monkeypatch, tmp_path):
+        home = tmp_path / "dev"
+        self._state_db(home, last_role="user", age=5)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(home))
+        adapter = self._adapter()
+        agent = adapter._agents["dev"]
+        adapter._forward_to_profile = lambda *_args: pytest.fail("must not dispatch")  # type: ignore
+
+        terminal, pending = adapter._prepare_task(self._params("status"), "voice", agent=agent)
+
+        assert pending is None
+        assert terminal["status"]["state"] == protocol.STATE_COMPLETED
+        payload = json.loads(protocol.extract_text(terminal["artifacts"][0]))
+        assert payload["protocol"] == "hermes-status-summary/v1"
+        assert payload["operation"] == "status"
+        assert payload["profile"] == "dev"
+        assert payload["state"] == "running"
+        assert payload["session_id"] == "sess-1"
+        assert payload["message_count"] == 4
+        assert payload["last_role"] == "user"
+
+    def test_old_unfinished_tail_is_stalled(self, monkeypatch, tmp_path):
+        home = tmp_path / "dev"
+        self._state_db(home, last_role="tool", age=3600)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(home))
+        adapter = self._adapter()
+
+        terminal, _ = adapter._prepare_task(
+            self._params('{"op":"status","session_id":"sess-1"}'),
+            "voice",
+            agent=adapter._agents["dev"],
+        )
+        payload = json.loads(protocol.extract_text(terminal["artifacts"][0]))
+        assert payload["state"] == "stalled"
+
+    def test_summary_is_bounded_and_redacted(self, monkeypatch, tmp_path):
+        home = tmp_path / "dev"
+        sensitive = "Итог для test@example.com: sk-" + ("a" * 40) + " " + ("длинно " * 300)
+        self._state_db(home, last_role="assistant", assistant_text=sensitive, age=5)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(home))
+        adapter = self._adapter()
+
+        terminal, _ = adapter._prepare_task(
+            self._params('{"op":"summary","session_id":"sess-1"}'),
+            "voice",
+            agent=adapter._agents["dev"],
+        )
+        text = protocol.extract_text(terminal["artifacts"][0])
+        payload = json.loads(text)
+        assert payload["state"] == "idle"
+        assert "[redacted-email]" in payload["summary"]
+        assert "sk-[redacted]" in payload["summary"]
+        assert len(payload["summary"]) <= 800
+        assert len(text) <= 2000
+
+    def test_missing_database_returns_unavailable(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(tmp_path / "missing"),
+        )
+        adapter = self._adapter()
+        terminal, _ = adapter._prepare_task(
+            self._params("summary"), "voice", agent=adapter._agents["dev"]
+        )
+        payload = json.loads(protocol.extract_text(terminal["artifacts"][0]))
+        assert terminal["status"]["state"] == protocol.STATE_COMPLETED
+        assert payload["state"] == "unavailable"
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            '{"op":"delete"}',
+            '{"op":"status","session_id":"../state.db"}',
+            '{"op":"status","extra":"not allowed"}',
+        ],
+    )
+    def test_invalid_structured_request_is_rejected(self, message):
+        adapter = self._adapter()
+        terminal, pending = adapter._prepare_task(
+            self._params(message), "voice", agent=adapter._agents["dev"]
+        )
+        assert pending is None
+        assert terminal["status"]["state"] == protocol.STATE_REJECTED
+
+
 class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):
         posted = {}

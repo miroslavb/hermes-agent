@@ -53,6 +53,43 @@ and push notification configs (inline or via
 memory — and the reply is returned over A2A. Completed tasks stay queryable
 via `tasks/get`.
 
+### Read-only status/summary mode
+
+For a local coordinator that must inspect profiles without giving peers a
+general agent execution path, enable the config-gated status endpoint:
+
+```yaml
+gateway:
+  platforms:
+    a2a:
+      enabled: true
+      extra:
+        port: 9900
+        status_summary_only: true
+        status_stale_after: 300
+        agents:
+          agent2:
+            profile: agent2
+            tenant: agent2
+          hermes3:
+            profile: hermes3
+            tenant: hermes3
+```
+
+The root URL reports the active/default profile; each configured agent is
+available at its path (for example `/agent2/`). Do not set `local: true` on a
+secondary profile: that flag routes normal tasks to the active gateway session
+rather than the named profile.
+
+This mode advertises only `status` and `summary` and accepts exactly those
+plain-text operations, or a JSON object such as
+`{"op":"summary","session_id":"sess-123"}`. It opens the routed profile's
+`state.db` with SQLite `mode=ro`, never invokes a model or profile process,
+rejects extra fields and unsafe session ids, and bounds/redacts summary text.
+An unfinished recent user/tool tail is `running`; once older than
+`status_stale_after` it is `stalled`; a terminal assistant tail is `idle`; a
+missing or unreadable database is `unavailable`.
+
 ## Security
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1` and refuses to

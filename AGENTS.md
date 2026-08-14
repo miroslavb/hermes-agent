@@ -1279,6 +1279,13 @@ automatically scope to the active profile.
    This is intentional — it lets `hermes -p coder profile list` see all profiles regardless
    of which one is active.
 
+7. **A2A read-only profile inspection must remain fail-closed** — when
+   `gateway.platforms.a2a.extra.status_summary_only` is enabled, only exact
+   `status`/`summary` requests may be accepted. Read routed profile databases
+   via SQLite `mode=ro`; never forward to a profile, gateway handler, model, or
+   tool. Bound and redact output, reject unknown JSON fields and unsafe session
+   ids, and do not set `local: true` for secondary multiplex profiles.
+
 ## Known Pitfalls
 
 ### DO NOT hardcode `~/.hermes` paths

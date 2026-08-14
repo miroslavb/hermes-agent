@@ -64,6 +64,12 @@ _ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_STATUS_SUMMARY_PROTOCOL = "hermes-status-summary/v1"
+_STATUS_SUMMARY_OPERATIONS = frozenset({"status", "summary"})
+_STATUS_SUMMARY_KEYS = frozenset({"op", "session_id"})
+_STATUS_SUMMARY_SESSION_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+_STATUS_SUMMARY_MAX_CHARS = 800
+_STATUS_STALE_AFTER = 300
 
 
 def _reply_timeout() -> float:
@@ -126,6 +132,51 @@ def _safe_context_slug(value: str, max_len: int = 96) -> str:
     """Sanitize attacker-provided context ids before using in session titles."""
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-._")
     return (slug or "ctx")[:max_len]
+
+
+def _parse_status_summary_request(text: str) -> tuple[Optional[dict], str]:
+    """Parse the deliberately tiny read-only status/summary request grammar."""
+    stripped = str(text or "").strip()
+    operation = stripped.lower()
+    if operation in _STATUS_SUMMARY_OPERATIONS:
+        return {"op": operation, "session_id": ""}, ""
+
+    try:
+        request = json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "Read-only endpoint accepts only 'status' or 'summary'."
+
+    if not isinstance(request, dict) or not request or set(request) - _STATUS_SUMMARY_KEYS:
+        return None, "Read-only endpoint accepts only 'status' or 'summary'."
+    operation = request.get("op")
+    if not isinstance(operation, str) or operation.lower() not in _STATUS_SUMMARY_OPERATIONS:
+        return None, "Read-only endpoint accepts only 'status' or 'summary'."
+    session_id = request.get("session_id", "")
+    if not isinstance(session_id, str) or (
+        session_id and _STATUS_SUMMARY_SESSION_RE.fullmatch(session_id) is None
+    ):
+        return None, "Invalid status/summary session_id."
+    return {"op": operation.lower(), "session_id": session_id}, ""
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    """Return SQLite columns for one fixed, trusted table name."""
+    queries = {
+        "sessions": 'PRAGMA table_info("sessions")',
+        "messages": 'PRAGMA table_info("messages")',
+    }
+    query = queries.get(table)
+    if query is None:
+        return set()
+    return {str(row[1]) for row in connection.execute(query)}
+
+
+def _select_columns(columns: set[str], wanted: tuple[str, ...]) -> str:
+    """Build a stable projection across historical state.db schemas."""
+    return ", ".join(
+        f'"{name}"' if name in columns else f'NULL AS "{name}"'
+        for name in wanted
+    )
 
 
 def _method_info(method: str) -> tuple[str, bool]:
@@ -352,6 +403,12 @@ class A2AAdapter(BasePlatformAdapter):
                 or os.getenv("A2A_ADVERTISED_TOOLSETS", "").split(",")
             ) if str(t).strip()
         ]
+        self._status_summary_only = bool(extra.get("status_summary_only", False))
+        try:
+            stale_after = int(extra.get("status_stale_after", _STATUS_STALE_AFTER))
+        except (TypeError, ValueError):
+            stale_after = _STATUS_STALE_AFTER
+        self._status_stale_after = max(30, min(stale_after, 86_400))
         self._active_profile = _active_profile_name()
         self._agents = self._load_served_agents(extra)
 
@@ -623,6 +680,21 @@ class A2AAdapter(BasePlatformAdapter):
         restricts what we advertise; without a registry we fall back to that
         static list.
         """
+        if self._status_summary_only:
+            return [
+                {
+                    "id": "hermes.status",
+                    "name": "status",
+                    "description": "Read-only status of the routed Hermes profile",
+                    "tags": ["status", "read-only"],
+                },
+                {
+                    "id": "hermes.summary",
+                    "name": "summary",
+                    "description": "Bounded, redacted summary of the routed Hermes profile",
+                    "tags": ["summary", "read-only", "redacted"],
+                },
+            ]
         try:
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
@@ -729,6 +801,11 @@ class A2AAdapter(BasePlatformAdapter):
                 "Empty task — nothing to do.", created_at=rec["created_iso"],
             ), None
 
+        if self._status_summary_only:
+            return self._complete_status_summary_task(
+                params, peer, agent, text, task_id, context_id
+            ), None
+
         framed = security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
@@ -801,6 +878,278 @@ class A2AAdapter(BasePlatformAdapter):
         if not home:
             return None
         return os.path.join(home, "state.db")
+
+    @staticmethod
+    def _status_summary_unavailable(operation: str, profile: str, reason: str) -> dict:
+        return {
+            "protocol": _STATUS_SUMMARY_PROTOCOL,
+            "operation": operation,
+            "profile": profile,
+            "state": "unavailable",
+            "reason": reason,
+            "session_id": None,
+        }
+
+    def _read_status_summary(
+        self,
+        profile: str,
+        operation: str,
+        session_id: str = "",
+    ) -> dict:
+        """Read bounded session status from one profile's SQLite database.
+
+        The connection is opened with SQLite ``mode=ro`` and every projection
+        is assembled from a fixed allow-list so this path cannot mutate state
+        or turn the optional session id into SQL.
+        """
+        db = self._profile_state_db(profile)
+        if not db or not os.path.isfile(db):
+            return self._status_summary_unavailable(
+                operation, profile, "state database not found"
+            )
+
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            quoted_path = urllib.parse.quote(os.path.abspath(db), safe="/")
+            connection = sqlite3.connect(
+                f"file:{quoted_path}?mode=ro", uri=True, timeout=2
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+
+            session_columns = _table_columns(connection, "sessions")
+            if "id" not in session_columns:
+                return self._status_summary_unavailable(
+                    operation, profile, "sessions table unavailable"
+                )
+
+            session_fields = (
+                "id",
+                "title",
+                "source",
+                "started_at",
+                "ended_at",
+                "message_count",
+                "tool_call_count",
+                "last_activity_at",
+                "last_activity_description",
+            )
+            where: list[str] = []
+            values: list[Any] = []
+            if session_id:
+                where.append('"id" = ?')
+                values.append(session_id)
+            elif "archived" in session_columns:
+                where.append('COALESCE("archived", 0) = 0')
+
+            order_candidates = [
+                name
+                for name in ("last_activity_at", "ended_at", "started_at")
+                if name in session_columns
+            ]
+            order_by = (
+                "COALESCE(" + ", ".join(f'"{name}"' for name in order_candidates)
+                + ", 0) DESC"
+                if order_candidates
+                else '"id" DESC'
+            )
+            query = (
+                f"SELECT {_select_columns(session_columns, session_fields)} "
+                'FROM "sessions" '
+                + (("WHERE " + " AND ".join(where) + " ") if where else "")
+                + f"ORDER BY {order_by} LIMIT 1"
+            )
+            session = connection.execute(query, values).fetchone()
+            if session is None:
+                payload = self._status_summary_unavailable(
+                    operation,
+                    profile,
+                    "requested session not found" if session_id else "no sessions",
+                )
+                if not session_id:
+                    payload["state"] = "idle"
+                return payload
+
+            session_data = dict(session)
+            selected_id = str(session_data.get("id") or "")
+            message_columns = _table_columns(connection, "messages")
+            tail: Optional[sqlite3.Row] = None
+            summary_row: Optional[sqlite3.Row] = None
+            if {"session_id", "role"}.issubset(message_columns):
+                message_fields = (
+                    "role",
+                    "content",
+                    "tool_calls",
+                    "tool_name",
+                    "timestamp",
+                    "finish_reason",
+                )
+                message_where = ['"session_id" = ?']
+                if "active" in message_columns:
+                    message_where.append('COALESCE("active", 1) = 1')
+                message_order = []
+                if "id" in message_columns:
+                    message_order.append('"id" DESC')
+                if "timestamp" in message_columns:
+                    message_order.append('"timestamp" DESC')
+                if not message_order:
+                    message_order.append("rowid DESC")
+                message_base = (
+                    f"SELECT {_select_columns(message_columns, message_fields)} "
+                    'FROM "messages" WHERE '
+                    + " AND ".join(message_where)
+                )
+                tail = connection.execute(
+                    message_base + " ORDER BY " + ", ".join(message_order) + " LIMIT 1",
+                    (selected_id,),
+                ).fetchone()
+                if operation == "summary" and "content" in message_columns:
+                    summary_row = connection.execute(
+                        message_base
+                        + " AND lower(\"role\") = 'assistant' "
+                        + "AND COALESCE(\"content\", '') <> '' ORDER BY "
+                        + ", ".join(message_order)
+                        + " LIMIT 1",
+                        (selected_id,),
+                    ).fetchone()
+
+            tail_data = dict(tail) if tail is not None else {}
+            last_role = str(tail_data.get("role") or "").lower()
+            tool_calls = tail_data.get("tool_calls")
+            has_tool_calls = bool(tool_calls) and str(tool_calls).strip() not in {
+                "[]",
+                "null",
+                "None",
+            }
+
+            activity_values = []
+            for value in (
+                session_data.get("last_activity_at"),
+                tail_data.get("timestamp"),
+                session_data.get("ended_at"),
+            ):
+                try:
+                    if value is not None:
+                        activity_values.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            if not activity_values:
+                try:
+                    started_at = session_data.get("started_at")
+                    if started_at is not None:
+                        activity_values.append(float(started_at))
+                except (TypeError, ValueError):
+                    pass
+            last_activity_at = max(activity_values) if activity_values else None
+            activity_age = (
+                max(0, int(time.time() - last_activity_at))
+                if last_activity_at is not None
+                else None
+            )
+            unfinished_tail = (
+                last_role in {"user", "tool"}
+                or (last_role == "assistant" and has_tool_calls)
+            )
+            if session_data.get("ended_at") is not None or not unfinished_tail:
+                state = "idle"
+            elif activity_age is not None and activity_age > self._status_stale_after:
+                state = "stalled"
+            else:
+                state = "running"
+
+            def bounded(value: Any, limit: int) -> str:
+                return security.redact_outbound(str(value or ""))[:limit]
+
+            payload = {
+                "protocol": _STATUS_SUMMARY_PROTOCOL,
+                "operation": operation,
+                "profile": profile,
+                "state": state,
+                "session_id": selected_id,
+                "title": bounded(session_data.get("title"), 200),
+                "source": bounded(session_data.get("source"), 80),
+                "message_count": int(session_data.get("message_count") or 0),
+                "tool_call_count": int(session_data.get("tool_call_count") or 0),
+                "last_role": last_role or None,
+                "last_activity_at": last_activity_at,
+                "last_activity_age_seconds": activity_age,
+                "last_activity": bounded(
+                    session_data.get("last_activity_description"), 240
+                ),
+            }
+            if operation == "summary":
+                summary_data = dict(summary_row) if summary_row is not None else {}
+                summary = (
+                    summary_data.get("content")
+                    or session_data.get("last_activity_description")
+                    or session_data.get("title")
+                    or ""
+                )
+                payload["summary"] = bounded(summary, _STATUS_SUMMARY_MAX_CHARS)
+            return payload
+        except sqlite3.Error:
+            logger.debug("A2A: status/summary state database read failed", exc_info=True)
+            return self._status_summary_unavailable(
+                operation, profile, "state database unreadable"
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _complete_status_summary_task(
+        self,
+        params: dict,
+        peer: str,
+        agent: dict,
+        text: str,
+        task_id: str,
+        context_id: str,
+    ) -> dict:
+        """Complete a read-only request without entering any agent/model path."""
+        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        self._register_inline_push(task_id, params, agent=agent)
+        security.audit("inbound", peer, task_id, text)
+        protocol.persist_message(context_id, "user", text, task_id)
+        protocol.metrics.inbound_total += 1
+
+        request, error = _parse_status_summary_request(text)
+        if request is None:
+            reply = security.redact_outbound(error)
+            self.tasks.complete(task_id, protocol.STATE_REJECTED, reply)
+            protocol.persist_message(context_id, "agent", reply, task_id)
+            security.audit("outbound", peer, task_id, reply)
+            protocol.metrics.tasks_failed += 1
+            self._send_push_notification(
+                task_id, context_id, reply, protocol.STATE_REJECTED
+            )
+            return protocol.build_task(
+                task_id,
+                context_id,
+                protocol.STATE_REJECTED,
+                reply,
+                created_at=rec["created_iso"],
+            )
+
+        profile = str(agent.get("profile") or agent.get("slug") or "default")
+        payload = self._read_status_summary(
+            profile, request["op"], request["session_id"]
+        )
+        reply = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        self.tasks.complete(task_id, protocol.STATE_COMPLETED, reply)
+        protocol.persist_message(context_id, "agent", reply, task_id)
+        security.audit("outbound", peer, task_id, reply)
+        protocol.metrics.outbound_total += 1
+        protocol.metrics.tasks_completed += 1
+        self._send_push_notification(
+            task_id, context_id, reply, protocol.STATE_COMPLETED
+        )
+        return protocol.build_task(
+            task_id,
+            context_id,
+            protocol.STATE_COMPLETED,
+            reply,
+            created_at=rec["created_iso"],
+        )
 
     def _lookup_forward_session(self, profile: str, title: str) -> str:
         db = self._profile_state_db(profile)
