@@ -313,6 +313,15 @@ hermes-agent/
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
+### SQLite post-commit maintenance invariant
+
+`SessionDB._execute_write()` commits the caller's transaction before periodic
+WAL checkpoint or FTS merge maintenance runs. Those maintenance hooks are
+best-effort: no ordinary `Exception` may escape and turn a durable transcript
+append into `session_persistence_failed`. Log the exception class and message,
+and cover this boundary with a regression that proves the row and session
+counter were committed exactly once.
+
 ## TypeScript Style
 
 Applies to TypeScript across Hermes: desktop, TUI, website, and future TS packages.

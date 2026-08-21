@@ -12,18 +12,13 @@ without setting an exception") — which is NOT a ``sqlite3.Error``, so it
 escaped ``_execute_write``'s entire retry net and destroyed the user's
 turn as ``session_persistence_failed``.
 
-Two independent layers are asserted here:
-
-1. The unlocked readers now route through ``_read_ctx()`` (per-thread
-   read-only connections under WAL), so hammering them concurrently with
-   turn-shaped batch writes must produce ZERO errors on either side.
-2. Defense in depth: even if some future code path reintroduces the race,
-   a message-scoped ``SystemError`` inside ``_execute_write`` retries
-   like locked/busy instead of killing the turn; any other SystemError
-   still propagates untouched.
+The unlocked readers now route through ``_read_ctx()`` (per-thread read-only
+connections under WAL), so hammering them concurrently with turn-shaped batch
+writes must produce ZERO errors on either side. The fix is structural rather
+than a blind callback retry: the same low-level error can surface after commit,
+where replay would duplicate already-durable transcript rows.
 """
 
-import sqlite3
 import threading
 import time
 
@@ -193,52 +188,3 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             "raises SystemError, destroying the turn as "
             "session_persistence_failed" % (violations,)
         )
-
-
-class TestSystemErrorRetryNet:
-    """Layer 2: ``_execute_write`` treats the cross-thread-race SystemError
-    as transient instead of letting it escape the retry net."""
-
-    def test_transient_system_error_is_retried_to_success(self, db):
-        calls = {"n": 0}
-
-        def flaky(conn):
-            calls["n"] += 1
-            if calls["n"] <= 3:
-                raise SystemError(
-                    "<TrackedConnection object at 0x0> returned NULL "
-                    "without setting an exception"
-                )
-            conn.execute(
-                "INSERT INTO state_meta (key, value) VALUES ('se', 'ok') "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-            )
-            return "done"
-
-        assert db._execute_write(flaky) == "done"
-        assert calls["n"] == 4
-        assert db.get_meta("se") == "ok"
-
-    def test_unrelated_system_error_propagates_immediately(self, db):
-        calls = {"n": 0}
-
-        def broken(conn):
-            calls["n"] += 1
-            raise SystemError("something else entirely")
-
-        with pytest.raises(SystemError, match="something else"):
-            db._execute_write(broken)
-        assert calls["n"] == 1
-
-    def test_exhausted_patience_propagates_the_system_error(
-        self, db, monkeypatch
-    ):
-        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.05)
-
-        def always(conn):
-            raise SystemError(
-                "<Connection> returned NULL without setting an exception"
-            )
-
-        with pytest.raises(SystemError, match="returned NULL"):
-            db._execute_write(always)

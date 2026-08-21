@@ -2778,6 +2778,34 @@ class TestOptimizeFts:
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 
+    def test_post_commit_fts_maintenance_error_does_not_fail_write(
+        self, db, monkeypatch, caplog
+    ):
+        """Best-effort FTS maintenance cannot invalidate a committed append."""
+        db._FTS_MERGE_EVERY_N_WRITES = 2
+        error = SystemError(
+            "<TrackedConnection object> returned NULL without setting an exception"
+        )
+
+        def _broken_merge(*, max_pages):
+            raise error
+
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _broken_merge)
+        db.create_session(session_id="s1", source="cli")
+
+        with caplog.at_level("WARNING", logger="hermes_state"):
+            row_id = db.append_message(
+                session_id="s1", role="user", content="committed exactly once"
+            )
+
+        assert isinstance(row_id, int)
+        assert db._conn.execute(
+            "SELECT count(*) FROM messages WHERE session_id = ? AND content = ?",
+            ("s1", "committed exactly once"),
+        ).fetchone()[0] == 1
+        assert db.get_session("s1")["message_count"] == 1
+        assert "FTS incremental merge failed" in caplog.text
+        assert "SystemError" in caplog.text
 
 
 class TestAutoMaintenance:

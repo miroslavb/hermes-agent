@@ -87,11 +87,18 @@ class SessionSearchMixin:
             self._merge_fts_incrementally(
                 max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX
             )
-        except sqlite3.Error as exc:
-            # Routine maintenance is best effort, but unexpected SQLite errors
-            # must remain visible instead of being silently mistaken for an
-            # optional missing index.
-            logger.warning("FTS incremental merge failed: %s", exc)
+        except Exception as exc:
+            # This runs strictly after the caller's transaction committed.
+            # No maintenance failure may escape and make that durable write
+            # look unsuccessful: low-level sqlite/FTS bridges can surface a
+            # SystemError instead of sqlite3.Error (for example, "returned
+            # NULL without setting an exception"). Keep every failure visible
+            # in logs, but never invalidate the completed transcript append.
+            logger.warning(
+                "FTS incremental merge failed (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """Return deferred-rebuild progress, or None when no rebuild pending.
