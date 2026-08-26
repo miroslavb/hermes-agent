@@ -26,6 +26,13 @@ reviewing any change:
   high. Most new capability should arrive as a CLI command + skill, a
   service-gated tool, or a plugin — not as core surface.
 
+Codex app-server has a separate authentication invariant: when
+`model.openai_runtime: codex_app_server` is enabled for an OpenAI/Codex
+provider, runtime resolution delegates authentication entirely to the Codex
+CLI and must not depend on Hermes' credential pool or singleton OAuth state.
+Keep regression coverage for missing and exhausted Hermes credentials so a
+429 cannot silently route an opted-in session back to direct Responses calls.
+
 ## Contribution Rubric — What We Want / What We Don't
 
 This is the project's intent layer. Use it two ways:

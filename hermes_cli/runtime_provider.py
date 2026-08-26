@@ -1935,6 +1935,42 @@ def resolve_runtime_provider(
     )
     model_cfg = _get_model_config()
 
+    # ``codex_app_server`` delegates authentication to the Codex CLI process,
+    # which owns its own ``~/.codex`` credential lifecycle.  Resolve this
+    # before Hermes' explicit-credential / pool / singleton branches so a
+    # missing or exhausted ``~/.hermes/auth.json`` entry cannot silently push
+    # an opted-in session back onto the direct Codex Responses transport.
+    #
+    # The api_key is a non-secret constructor placeholder: the app-server
+    # early-return path never sends it over the wire, but AIAgent's shared
+    # initialization still expects a non-empty value.
+    if (
+        _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode="codex_responses" if provider == "openai-codex" else "chat_completions",
+            model_cfg=model_cfg,
+        )
+        == "codex_app_server"
+    ):
+        provider_cfg = PROVIDER_REGISTRY.get(provider)
+        configured_base_url = str(model_cfg.get("base_url") or "").strip()
+        return {
+            "provider": provider,
+            "api_mode": "codex_app_server",
+            "base_url": (
+                (explicit_base_url or "").strip().rstrip("/")
+                or configured_base_url.rstrip("/")
+                or (
+                    provider_cfg.inference_base_url.rstrip("/")
+                    if provider_cfg and provider_cfg.inference_base_url
+                    else DEFAULT_CODEX_BASE_URL
+                )
+            ),
+            "api_key": "codex-app-server-cli-auth",
+            "source": "codex-app-server-cli-auth",
+            "requested_provider": requested_provider,
+        }
+
     # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
     # "Ox Alpha"): served ANONYMOUSLY on the Zen relay ONLY. Any bearer the
     # relay doesn't recognize is a 401 — and the Go relay doesn't serve the

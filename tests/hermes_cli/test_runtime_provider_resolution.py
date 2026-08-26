@@ -86,6 +86,41 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_codex_app_server_bypasses_exhausted_hermes_credentials(monkeypatch):
+    """CLI-owned auth must not fall back to Hermes' exhausted OAuth store."""
+
+    class _ExhaustedPool:
+        def has_credentials(self):
+            return False
+
+    model_cfg = {
+        "provider": "openai-codex",
+        "default": "gpt-5.6-sol",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "openai_runtime": "codex_app_server",
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: {"model": model_cfg})
+    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _ExhaustedPool())
+
+    def _unexpected_hermes_auth():
+        raise AssertionError("codex_app_server must not read Hermes OAuth credentials")
+
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _unexpected_hermes_auth)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-codex",
+        target_model="gpt-5.6-sol",
+    )
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["api_key"] == "codex-app-server-cli-auth"
+    assert resolved["source"] == "codex-app-server-cli-auth"
+    assert "credential_pool" not in resolved
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth
