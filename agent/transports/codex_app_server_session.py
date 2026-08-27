@@ -277,6 +277,7 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        codex_extra_args: Optional[list[str]] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -286,6 +287,7 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._codex_extra_args = list(codex_extra_args or [])
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -319,9 +321,15 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
-            )
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            # Preserve compatibility with injected factories that predate
+            # launch overrides when this session does not need any.
+            if self._codex_extra_args:
+                client_kwargs["extra_args"] = self._codex_extra_args
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",

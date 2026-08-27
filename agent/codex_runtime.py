@@ -102,6 +102,41 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
+def _codex_app_server_launch_args(model: str) -> list[str]:
+    """Return Codex CLI config overrides for a Hermes context variant.
+
+    ``-900k`` is a Hermes-side opt-in alias.  The Responses transport strips
+    it before sending the request, but app-server owns its model selection and
+    context policy at subprocess startup.  Without matching launch overrides,
+    Codex falls back to the base model's locally advertised 272K window and
+    reports an effective 258.4K window (95%), causing native compaction around
+    235K even though the user explicitly selected the large-context variant.
+    """
+    from agent.model_metadata import (
+        _verified_codex_ctx_for_slug,
+        is_codex_context_variant,
+        strip_codex_context_variant_suffix,
+    )
+
+    if not is_codex_context_variant(model):
+        return []
+    context_window = _verified_codex_ctx_for_slug(model)
+    if not context_window:
+        return []
+    # The namespace is useful to Hermes' provider routing but Codex's model
+    # config expects the catalog slug itself.
+    wire_model = strip_codex_context_variant_suffix(model).rsplit("/", 1)[-1]
+    compact_limit = int(context_window * 0.90)
+    return [
+        "-c",
+        f'model="{wire_model}"',
+        "-c",
+        f"model_context_window={context_window}",
+        "-c",
+        f"model_auto_compact_token_limit={compact_limit}",
+    ]
+
+
 def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
@@ -153,14 +188,20 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    input_tokens_total = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    # Codex token_count semantics match the rollout JSONL: inputTokens is the
+    # full prompt count and cachedInputTokens is a subset, not an additional
+    # bucket. CanonicalUsage expects its input bucket to exclude cache reads,
+    # so subtract here and let prompt_tokens add the two buckets back once.
+    cache_read_tokens = min(cache_read_tokens, input_tokens_total)
+    uncached_input_tokens = input_tokens_total - cache_read_tokens
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
 
     canonical_usage = CanonicalUsage(
-        input_tokens=input_tokens,
+        input_tokens=uncached_input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=0,
@@ -519,6 +560,37 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
+    def _refresh_live_token_usage(params: dict) -> None:
+        """Refresh display-only usage without running compression latches.
+
+        The authoritative accounting path runs once after turn completion.
+        Calling ContextCompressor.update_from_response() for every app-server
+        notification would repeatedly adjudicate compaction state, so the live
+        bridge updates only the fields read by status surfaces.
+        """
+        token_usage = params.get("tokenUsage") or {}
+        if not isinstance(token_usage, dict):
+            return
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is None:
+            return
+        last = token_usage.get("last")
+        if isinstance(last, dict):
+            prompt_tokens = _coerce_usage_int(last.get("inputTokens"))
+            completion_tokens = _coerce_usage_int(last.get("outputTokens"))
+            total_tokens = (
+                _coerce_usage_int(last.get("totalTokens"))
+                or prompt_tokens + completion_tokens
+            )
+            compressor.last_prompt_tokens = prompt_tokens
+            compressor.last_completion_tokens = completion_tokens
+            compressor.last_total_tokens = total_tokens
+            if prompt_tokens > 0:
+                compressor.last_real_prompt_tokens = prompt_tokens
+        context_window = token_usage.get("modelContextWindow")
+        if isinstance(context_window, int) and context_window > 0:
+            compressor.context_length = context_window
+
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
         live TUI tool card correlates with the same tool call after the
@@ -653,6 +725,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}
+        if method == "thread/tokenUsage/updated":
+            _refresh_live_token_usage(params)
+            return
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return
@@ -756,6 +831,9 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_extra_args=_codex_app_server_launch_args(
+                getattr(agent, "model", "")
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

@@ -140,6 +140,39 @@ class TestApprovalChoiceMapping:
         assert _approval_choice_to_codex_decision(choice) == expected
 
 
+class TestClientLaunch:
+    def test_default_launch_keeps_legacy_factory_signature(self):
+        client = FakeClient()
+
+        def legacy_factory(*, codex_bin, codex_home):
+            assert codex_bin == "codex"
+            assert codex_home is None
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=legacy_factory,
+        )
+
+        assert session.ensure_started() == "thread-fake-001"
+
+    def test_extra_args_are_forwarded_to_client_factory(self):
+        client = FakeClient()
+        captured = {}
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            codex_extra_args=["-c", "model_context_window=900000"],
+            client_factory=lambda **kwargs: captured.update(kwargs) or client,
+        )
+
+        session.ensure_started()
+
+        assert captured["extra_args"] == [
+            "-c",
+            "model_context_window=900000",
+        ]
+
+
 class TestTurnInputCoercion:
     def test_list_content_keeps_text_and_marks_images(self):
         text = _coerce_turn_input_text([
@@ -895,4 +928,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

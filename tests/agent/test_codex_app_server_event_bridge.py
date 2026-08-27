@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.codex_runtime import (
+    _codex_app_server_launch_args,
     _codex_item_completion_payload,
     _codex_item_to_args,
     _codex_item_to_preview,
@@ -38,6 +39,13 @@ def _make_stub_agent() -> SimpleNamespace:
         _fire_reasoning_delta=MagicMock(name="_fire_reasoning_delta"),
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
+        ),
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=0,
+            last_completion_tokens=0,
+            last_total_tokens=0,
+            last_real_prompt_tokens=0,
+            context_length=0,
         ),
     )
 
@@ -175,6 +183,49 @@ class TestStreamDeltaDispatch:
                 "params": {"delta": "thinking..."}})
         agent._fire_reasoning_delta.assert_called_once_with("thinking...")
         agent._fire_stream_delta.assert_not_called()
+
+
+class TestLiveTokenUsageDispatch:
+    def test_refreshes_prompt_and_effective_context_without_double_counting_cache(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 129_161,
+                        "cachedInputTokens": 127_744,
+                        "outputTokens": 895,
+                        "totalTokens": 130_056,
+                    },
+                    "modelContextWindow": 828_400,
+                }
+            },
+        })
+
+        compressor = agent.context_compressor
+        assert compressor.last_prompt_tokens == 129_161
+        assert compressor.last_completion_tokens == 895
+        assert compressor.last_total_tokens == 130_056
+        assert compressor.last_real_prompt_tokens == 129_161
+        assert compressor.context_length == 828_400
+
+
+class TestAppServerLaunchArgs:
+    def test_900k_variant_sets_wire_model_and_context_policy(self):
+        assert _codex_app_server_launch_args("gpt-5.6-sol-900k") == [
+            "-c",
+            'model="gpt-5.6-sol"',
+            "-c",
+            "model_context_window=900000",
+            "-c",
+            "model_auto_compact_token_limit=810000",
+        ]
+
+    def test_base_model_keeps_codex_default_context_policy(self):
+        assert _codex_app_server_launch_args("gpt-5.6-sol") == []
 
 
 class TestToolProgressDispatch:

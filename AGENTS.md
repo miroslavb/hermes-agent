@@ -1453,6 +1453,25 @@ automatically scope to the active profile.
 
 ## Known Pitfalls
 
+### Codex app-server context variants are launch-time policy
+Hermes' Codex ``-900k`` model ids are opt-in aliases, not wire model names.
+The Responses transport strips the suffix per request, but ``codex app-server``
+owns its model and context policy for the lifetime of its subprocess. Keep
+``agent.codex_runtime._codex_app_server_launch_args`` wired through
+``CodexAppServerSession.codex_extra_args`` so a large-context variant starts
+with the base model slug plus explicit ``model_context_window`` and
+``model_auto_compact_token_limit`` overrides. Otherwise Codex silently falls
+back to its advertised 272K policy (258.4K effective after headroom) and
+compacts the thread around 235K.
+
+Treat ``thread/tokenUsage/updated`` as authoritative for the live effective
+window and prompt size. Its ``cachedInputTokens`` is a subset of
+``inputTokens``; never add it a second time. The event bridge may update the
+display fields on every notification, but must not call
+``ContextCompressor.update_from_response()`` there because that method also
+advances compaction latches; authoritative accounting remains once per
+completed turn.
+
 ### DO NOT infer process identity from argv substrings
 The bug class behind ~10 fleet-update issues (#90778, #87594, #78089,
 #76129, #91964, ...): classifying a process by `"serve" in cmdline` or
