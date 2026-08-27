@@ -1545,3 +1545,11 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## Host LLM Flash Route Artifact (2026-08-27)
+
+The installed host fallback for OpenRouter/Nous and the TUI no-config path is
+`z-ai/glm-5.3-flash`. Keep the shipped manifest, offline fallback constant,
+and TUI emergency fallback aligned. Legacy model IDs may remain in provider
+catalogs, compatibility logic, tests, and historical incident documentation,
+but must not become an implicit runtime default.

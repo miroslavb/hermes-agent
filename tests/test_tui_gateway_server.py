@@ -3258,6 +3258,16 @@ def test_resolve_model_strips_config_model(monkeypatch):
     assert server._resolve_model() == "nous/hermes-test"
 
 
+def test_resolve_model_uses_preferred_silent_default(monkeypatch):
+    from hermes_cli.models import get_preferred_silent_default_model
+
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    assert server._resolve_model() == get_preferred_silent_default_model()
+
+
 def _sync_test_session(**extra):
     session = {
         "agent": types.SimpleNamespace(model="old/model"),

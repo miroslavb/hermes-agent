@@ -3619,7 +3619,7 @@ def _resolve_model() -> str:
 
         return get_preferred_silent_default_model()
     except Exception:
-        return "z-ai/glm-5.2"
+        return "z-ai/glm-5.3-flash"
 
 
 def _resolve_session_platform() -> str:
