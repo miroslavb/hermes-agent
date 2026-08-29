@@ -18,7 +18,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import run_agent
+from agent.codex_runtime import (
+    _build_codex_recovery_context,
+    _codex_app_server_launch_args,
+    _load_codex_thread_id,
+    _persist_codex_thread_id,
+    make_codex_app_server_event_bridge,
+    run_codex_app_server_turn,
+)
+from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from hermes_cli.codex_models import get_codex_model_ids
 
 
 @pytest.fixture
@@ -95,9 +105,9 @@ class TestRunConversationCodexPath:
                 thread_id="thread-usage-1",
                 token_usage_last={
                     "totalTokens": 130,
-                    "inputTokens": 80,
+                    "inputTokens": 100,
                     "cachedInputTokens": 20,
-                    "outputTokens": 25,
+                    "outputTokens": 30,
                     "reasoningOutputTokens": 5,
                 },
                 model_context_window=200000,
@@ -113,10 +123,10 @@ class TestRunConversationCodexPath:
 
         assert result["api_calls"] == 1
         assert result["prompt_tokens"] == 100
-        assert result["completion_tokens"] == 25
+        assert result["completion_tokens"] == 30
         assert result["total_tokens"] == 130
         assert result["input_tokens"] == 80
-        assert result["output_tokens"] == 25
+        assert result["output_tokens"] == 30
         assert result["cache_read_tokens"] == 20
         assert result["cache_write_tokens"] == 0
         assert result["reasoning_tokens"] == 5
@@ -124,15 +134,15 @@ class TestRunConversationCodexPath:
 
         assert agent.session_api_calls == 1
         assert agent.session_prompt_tokens == 100
-        assert agent.session_completion_tokens == 25
+        assert agent.session_completion_tokens == 30
         assert agent.session_total_tokens == 130
         assert agent.session_input_tokens == 80
-        assert agent.session_output_tokens == 25
+        assert agent.session_output_tokens == 30
         assert agent.session_cache_read_tokens == 20
         assert agent.session_cache_write_tokens == 0
         assert agent.session_reasoning_tokens == 5
         assert agent.context_compressor.last_prompt_tokens == 100
-        assert agent.context_compressor.last_completion_tokens == 25
+        assert agent.context_compressor.last_completion_tokens == 30
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
 
@@ -786,3 +796,336 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+class _ContinuityFakeClient:
+    def __init__(self, *, resume_fails: bool = False) -> None:
+        self.resume_fails = resume_fails
+        self.requests: list[tuple[str, dict]] = []
+        self.notifications: list[dict] = []
+        self.closed = False
+
+    def initialize(self, **_kwargs):
+        return {}
+
+    def request(self, method, params=None, timeout=30):
+        del timeout
+        params = params or {}
+        self.requests.append((method, params))
+        if method == "thread/resume":
+            if self.resume_fails:
+                raise CodexAppServerError(code=-32602, message="rollout missing")
+            return {"thread": {"id": params["threadId"]}}
+        if method == "thread/start":
+            return {"thread": {"id": "thread-recovered"}}
+        if method == "turn/start":
+            thread_id = params["threadId"]
+            self.notifications.extend(
+                [
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": "turn-1",
+                            "item": {
+                                "type": "agentMessage",
+                                "id": "message-1",
+                                "text": "continued",
+                            },
+                        },
+                    },
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "error": None,
+                            },
+                        },
+                    },
+                ]
+            )
+            return {"turn": {"id": "turn-1"}}
+        return {}
+
+    def take_notification(self, timeout=0):
+        del timeout
+        return self.notifications.pop(0) if self.notifications else None
+
+    def take_server_request(self, timeout=0):
+        del timeout
+        return None
+
+    def is_alive(self):
+        return not self.closed
+
+    def stderr_tail(self, _count=20):
+        return []
+
+    def close(self):
+        self.closed = True
+
+
+class _ThreadStateDB:
+    def __init__(self, state=None) -> None:
+        self.state = state
+        self.patches: list[tuple[str, dict]] = []
+
+    def get_session_model_config_value(self, session_id, key, default=None):
+        del session_id, key
+        return self.state if self.state is not None else default
+
+    def patch_session_model_config(self, session_id, patch):
+        self.patches.append((session_id, patch))
+
+
+def _continuity_agent(**overrides):
+    values = {
+        "session_api_calls": 0,
+        "session_prompt_tokens": 0,
+        "session_completion_tokens": 0,
+        "session_total_tokens": 0,
+        "session_input_tokens": 0,
+        "session_output_tokens": 0,
+        "session_cache_read_tokens": 0,
+        "session_cache_write_tokens": 0,
+        "session_reasoning_tokens": 0,
+        "session_estimated_cost_usd": 0.0,
+        "session_cost_status": "unknown",
+        "session_cost_source": "unknown",
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "",
+        "session_id": "session-1",
+        "_session_db": None,
+        "_session_db_created": True,
+        "context_compressor": SimpleNamespace(
+            update_from_response=MagicMock(),
+            context_length=272_000,
+        ),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestCodexContextContinuity:
+    """Regression contour for context lost after app-server retirement."""
+
+    def test_large_context_profile_is_forwarded_to_app_server(self):
+        assert _codex_app_server_launch_args("gpt-5.6-sol", 1_000_000) == [
+            "-c",
+            'model="gpt-5.6-sol"',
+            "-c",
+            "model_context_window=900000",
+            "-c",
+            "model_auto_compact_token_limit=810000",
+        ]
+        assert _codex_app_server_launch_args("gpt-5.6-sol", 272_000) == []
+        assert "model_context_window=900000" in _codex_app_server_launch_args(
+            "gpt-5.6-sol-900k", 272_000
+        )
+
+    def test_explicit_profile_context_collapses_fake_picker_aliases(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n  context_length: 1000000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        models = get_codex_model_ids()
+
+        assert "gpt-5.6-sol" in models
+        assert not any(model.endswith("-900k") for model in models)
+        assert len(models) == len(set(models))
+
+    def test_session_resumes_thread_without_replaying_recovery_context(self):
+        client = _ContinuityFakeClient()
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            resume_thread_id="thread-old",
+            recovery_context="<user>old task</user>",
+            client_factory=lambda **_kwargs: client,
+        )
+
+        result = session.run_turn(
+            "Status?", turn_timeout=1, notification_poll_timeout=0
+        )
+
+        assert result.thread_id == "thread-old"
+        assert session.resumable_thread_id == "thread-old"
+        assert client.requests[0][0] == "thread/resume"
+        turn_input = next(
+            params for method, params in client.requests if method == "turn/start"
+        )
+        assert turn_input["input"][0]["text"] == "Status?"
+
+    def test_missing_rollout_starts_new_thread_with_canonical_recovery(self):
+        client = _ContinuityFakeClient(resume_fails=True)
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            resume_thread_id="thread-pruned",
+            recovery_context=(
+                "<user>Build Pearl Hopper</user>\n"
+                "<assistant>Working</assistant>"
+            ),
+            client_factory=lambda **_kwargs: client,
+        )
+
+        result = session.run_turn(
+            "Status?", turn_timeout=1, notification_poll_timeout=0
+        )
+
+        assert result.thread_id == "thread-recovered"
+        assert session.resumable_thread_id == "thread-recovered"
+        assert [method for method, _params in client.requests[:2]] == [
+            "thread/resume",
+            "thread/start",
+        ]
+        turn_input = next(
+            params for method, params in client.requests if method == "turn/start"
+        )
+        text = turn_input["input"][0]["text"]
+        assert "Build Pearl Hopper" in text
+        assert "[Current user turn]\nStatus?" in text
+
+    def test_recovery_context_excludes_current_user_turn(self):
+        context = _build_codex_recovery_context(
+            [
+                {"role": "user", "content": "Build Pearl Hopper"},
+                {"role": "assistant", "content": "I am working on it"},
+                {"role": "user", "content": "Status?"},
+            ],
+            272_000,
+        )
+
+        assert context is not None
+        assert "Build Pearl Hopper" in context
+        assert "I am working on it" in context
+        assert "Status?" not in context
+
+    def test_thread_binding_is_model_scoped_and_durable(self):
+        db = _ThreadStateDB(
+            {"thread_id": "thread-old", "model": "gpt-5.6-sol"}
+        )
+        agent = SimpleNamespace(
+            _session_db=db,
+            _session_db_created=True,
+            session_id="session-1",
+            model="gpt-5.6-sol-900k",
+        )
+
+        assert _load_codex_thread_id(agent) == "thread-old"
+        _persist_codex_thread_id(agent, "thread-new")
+
+        assert db.patches == [
+            (
+                "session-1",
+                {
+                    "_codex_app_server_thread": {
+                        "thread_id": "thread-new",
+                        "model": "gpt-5.6-sol",
+                    }
+                },
+            )
+        ]
+
+    def test_live_usage_refreshes_effective_context_window(self):
+        agent = _continuity_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 100,
+                            "cachedInputTokens": 80,
+                            "outputTokens": 30,
+                            "totalTokens": 130,
+                        },
+                        "modelContextWindow": 828_400,
+                    }
+                },
+            }
+        )
+
+        assert agent.context_compressor.last_prompt_tokens == 100
+        assert agent.context_compressor.last_completion_tokens == 30
+        assert agent.context_compressor.last_total_tokens == 130
+        assert agent.context_compressor.context_length == 828_400
+
+    def test_runtime_wires_resume_recovery_launch_policy_and_persists(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class _Session:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.thread_id = kwargs.get("resume_thread_id")
+
+            def run_turn(self, user_input):
+                captured["user_input"] = user_input
+                return TurnResult(
+                    final_text="continued",
+                    thread_id="thread-old",
+                    turn_id="turn-1",
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            _Session,
+        )
+        db = _ThreadStateDB(
+            {"thread_id": "thread-old", "model": "gpt-5.6-sol"}
+        )
+        agent = _continuity_agent(
+            _session_db=db,
+            _codex_session=None,
+            _config_context_length=1_000_000,
+            session_cwd="/tmp",
+            compression_checkpoint_required=False,
+            _interrupt_requested=False,
+            _interrupt_message=None,
+            _iters_since_skill=0,
+            _skill_nudge_interval=0,
+            valid_tool_names=[],
+            _usage_anchor=None,
+            _sync_external_memory_for_turn=lambda **_kwargs: None,
+        )
+        # The live effective window is smaller than the requested launch
+        # window. A replacement process must re-apply profile policy, not feed
+        # Codex's discounted runtime figure back as the next launch override.
+        agent.context_compressor.context_length = 828_400
+        messages = [
+            {"role": "user", "content": "Build Pearl Hopper"},
+            {"role": "assistant", "content": "Working"},
+            {"role": "user", "content": "Status?"},
+        ]
+
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="Status?",
+            original_user_message="Status?",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        assert result["final_response"] == "continued"
+        assert captured["resume_thread_id"] == "thread-old"
+        assert "Build Pearl Hopper" in captured["recovery_context"]
+        assert "model_context_window=900000" in captured["codex_extra_args"]
+        assert captured["user_input"] == "Status?"
+        thread_state = db.patches[-1][1]["_codex_app_server_thread"]
+        assert thread_state["thread_id"] == "thread-old"

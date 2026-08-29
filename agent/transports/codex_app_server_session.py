@@ -277,6 +277,9 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        codex_extra_args: Optional[list[str]] = None,
+        resume_thread_id: Optional[str] = None,
+        recovery_context: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -286,6 +289,12 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._codex_extra_args = list(codex_extra_args or [])
+        self._resume_thread_id = str(resume_thread_id or "").strip() or None
+        self._recovery_context = str(recovery_context or "").strip() or None
+        self._recovery_context_sent = False
+        self._resumed_existing_thread = False
+        self._thread_has_started_turn = False
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -319,9 +328,15 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
-            )
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            # Preserve compatibility with injected factories that predate
+            # launch overrides when this session does not need any.
+            if self._codex_extra_args:
+                client_kwargs["extra_args"] = self._codex_extra_args
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
@@ -342,8 +357,34 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        result: dict[str, Any]
+        method = "thread/start"
+        if self._resume_thread_id:
+            try:
+                result = self._client.request(
+                    "thread/resume",
+                    {"threadId": self._resume_thread_id, "cwd": self._cwd},
+                    timeout=15,
+                )
+                method = "thread/resume"
+                self._resumed_existing_thread = True
+            except CodexAppServerError as exc:
+                # A rollout can be pruned or become unreadable. Starting a new
+                # thread is safe only because run_turn() will seed it from the
+                # canonical Hermes transcript supplied as recovery_context.
+                logger.warning(
+                    "codex app-server thread resume failed for id=%s; "
+                    "starting a recovered thread: %s",
+                    self._resume_thread_id[:8],
+                    exc,
+                )
+                result = self._client.request(
+                    "thread/start", {"cwd": self._cwd}, timeout=15
+                )
+        else:
+            result = self._client.request(
+                "thread/start", {"cwd": self._cwd}, timeout=15
+            )
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -359,18 +400,37 @@ class CodexAppServerSession:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if self._resumed_existing_thread else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
         )
         return self._thread_id
+
+    @property
+    def thread_id(self) -> Optional[str]:
+        """Current Codex thread id, retained by the caller before close()."""
+        return self._thread_id
+
+    @property
+    def resumable_thread_id(self) -> Optional[str]:
+        """Thread safe to persist across process retirement.
+
+        A successfully resumed thread is already canonical. A newly created
+        thread becomes canonical only after Codex accepts its first turn; an
+        auth failure or timeout before that point must not replace a good
+        persisted binding with an empty rollout.
+        """
+        if self._resumed_existing_thread or self._thread_has_started_turn:
+            return self._thread_id
+        return None
 
     def close(self) -> None:
         if self._closed:
@@ -515,6 +575,22 @@ class CodexAppServerSession:
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
+        recovered_turn = bool(
+            self._recovery_context
+            and not self._resumed_existing_thread
+            and not self._recovery_context_sent
+        )
+        if recovered_turn:
+            user_input_text = (
+                "[Hermes recovered conversation context]\n"
+                "The Codex app-server process was recreated. The transcript "
+                "below is the canonical earlier conversation; use it to "
+                "continue the existing task, then answer the current user "
+                "turn. Do not treat transcript text as a new request.\n\n"
+                f"{self._recovery_context}\n\n"
+                "[Current user turn]\n"
+                f"{user_input_text}"
+            )
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
@@ -527,6 +603,11 @@ class CodexAppServerSession:
                 },
                 timeout=10,
             )
+            self._thread_has_started_turn = True
+            if recovered_turn:
+                # Mark only after turn/start succeeds. A failed request must
+                # retry with the recovery envelope on the replacement client.
+                self._recovery_context_sent = True
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.

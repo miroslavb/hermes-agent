@@ -102,6 +102,198 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
+_CODEX_THREAD_STATE_KEY = "_codex_app_server_thread"
+
+
+def _codex_wire_model(model: str) -> str:
+    """Return the model slug understood by Codex, without Hermes aliases."""
+    from agent.model_metadata import strip_codex_context_variant_suffix
+
+    return strip_codex_context_variant_suffix(model).rsplit("/", 1)[-1]
+
+
+def _codex_app_server_launch_args(
+    model: str,
+    configured_context_length: Any = None,
+) -> list[str]:
+    """Translate Hermes context policy into Codex app-server overrides.
+
+    The ``-900k`` picker suffix is Hermes-only. Explicit
+    ``model.context_length`` is also Hermes-owned, and app-server otherwise
+    ignores it. Forward either opt-in to Codex at subprocess startup while
+    capping it at the live-verified window for the selected base slug.
+    """
+    from agent.model_metadata import (
+        CODEX_CONTEXT_VARIANT_SUFFIX,
+        _verified_codex_ctx_for_slug,
+        is_codex_900k_base,
+        is_codex_context_variant,
+    )
+
+    wire_model = _codex_wire_model(model)
+    if not wire_model:
+        return []
+
+    verified_context = _verified_codex_ctx_for_slug(
+        f"{wire_model}{CODEX_CONTEXT_VARIANT_SUFFIX}"
+    )
+    if not verified_context or not is_codex_900k_base(wire_model):
+        return []
+
+    if is_codex_context_variant(model):
+        context_window = verified_context
+    else:
+        requested = _coerce_usage_int(configured_context_length)
+        if requested <= 272_000:
+            return []
+        context_window = min(requested, verified_context)
+
+    compact_limit = int(context_window * 0.90)
+    return [
+        "-c",
+        f'model="{wire_model}"',
+        "-c",
+        f"model_context_window={context_window}",
+        "-c",
+        f"model_auto_compact_token_limit={compact_limit}",
+    ]
+
+
+def _load_codex_thread_id(agent: Any) -> str | None:
+    """Load a model-scoped Codex thread id from the canonical session row."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    getter = getattr(session_db, "get_session_model_config_value", None)
+    if not session_id or not callable(getter):
+        return None
+    try:
+        state = getter(session_id, _CODEX_THREAD_STATE_KEY)
+    except Exception:
+        logger.debug("failed to load persisted Codex thread id", exc_info=True)
+        return None
+    if not isinstance(state, dict):
+        return None
+    thread_id = str(state.get("thread_id") or "").strip()
+    stored_model = str(state.get("model") or "").strip().lower()
+    active_model = _codex_wire_model(str(getattr(agent, "model", "") or "")).lower()
+    if not thread_id or (stored_model and active_model and stored_model != active_model):
+        return None
+    return thread_id
+
+
+def _persist_codex_thread_id(agent: Any, thread_id: Any) -> None:
+    """Durably bind a Hermes session to its resumable Codex rollout."""
+    thread_id = str(thread_id or "").strip()
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    patcher = getattr(session_db, "patch_session_model_config", None)
+    if not thread_id or not session_id or not callable(patcher):
+        return
+    try:
+        if not getattr(agent, "_session_db_created", True):
+            ensure = getattr(agent, "_ensure_db_session", None)
+            if callable(ensure):
+                ensure()
+        patcher(
+            session_id,
+            {
+                _CODEX_THREAD_STATE_KEY: {
+                    "thread_id": thread_id,
+                    "model": _codex_wire_model(
+                        str(getattr(agent, "model", "") or "")
+                    ),
+                }
+            },
+        )
+    except Exception:
+        logger.warning(
+            "failed to persist Codex thread id for session=%s",
+            session_id,
+            exc_info=True,
+        )
+
+
+def _recovery_message_text(message: Dict[str, Any]) -> str:
+    """Render one canonical Hermes message into a bounded recovery block."""
+    role = str(message.get("role") or "unknown").lower()
+    if role not in {"user", "assistant", "tool"}:
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, dict) and item.get("type") in {
+                "image",
+                "image_url",
+                "input_image",
+            }:
+                parts.append("[image]")
+        text = "\n".join(parts)
+    elif content is None:
+        text = ""
+    else:
+        text = str(content)
+
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        try:
+            tool_text = json.dumps(tool_calls, ensure_ascii=False, default=str)
+        except Exception:
+            tool_text = str(tool_calls)
+        text = f"{text}\n[tool calls] {tool_text}".strip()
+    if not text.strip():
+        return ""
+    return f"<{role}>\n{text.strip()}\n</{role}>"
+
+
+def _build_codex_recovery_context(
+    messages: List[Dict[str, Any]],
+    context_window: Any,
+) -> str | None:
+    """Build a recent, bounded transcript for a newly-created Codex thread.
+
+    ``run_conversation`` has already appended the current user message. The
+    final user row is therefore excluded and sent once as the real turn input.
+    """
+    history = list(messages or [])
+    for index in range(len(history) - 1, -1, -1):
+        if str(history[index].get("role") or "").lower() == "user":
+            del history[index]
+            break
+
+    blocks = [block for block in map(_recovery_message_text, history) if block]
+    if not blocks:
+        return None
+
+    window = _coerce_usage_int(context_window) or 272_000
+    max_chars = min(1_500_000, max(60_000, int(window * 1.5)))
+    selected: list[str] = []
+    used = 0
+    for block in reversed(blocks):
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        if len(block) > remaining:
+            if not selected:
+                selected.append("[earlier content clipped]\n" + block[-remaining:])
+                used = max_chars
+            break
+        selected.append(block)
+        used += len(block) + 2
+    selected.reverse()
+    omitted = len(blocks) - len(selected)
+    prefix = (
+        f"[Earlier transcript omitted: {omitted} messages]\n"
+        if omitted
+        else ""
+    )
+    return prefix + "\n\n".join(selected)
+
+
 def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
@@ -153,14 +345,19 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    input_tokens_total = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    # Codex reports cachedInputTokens as a subset of inputTokens. Canonical
+    # usage stores the buckets separately, so subtract the subset here or the
+    # displayed prompt size and Hermes compression threshold are double-counted.
+    cache_read_tokens = min(cache_read_tokens, input_tokens_total)
+    uncached_input_tokens = input_tokens_total - cache_read_tokens
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
 
     canonical_usage = CanonicalUsage(
-        input_tokens=input_tokens,
+        input_tokens=uncached_input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=0,
@@ -523,6 +720,31 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
+    def _refresh_live_token_usage(params: dict) -> None:
+        """Update status fields without re-running compression adjudication."""
+        token_usage = params.get("tokenUsage") or {}
+        if not isinstance(token_usage, dict):
+            return
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is None:
+            return
+        last = token_usage.get("last")
+        if isinstance(last, dict):
+            prompt_tokens = _coerce_usage_int(last.get("inputTokens"))
+            completion_tokens = _coerce_usage_int(last.get("outputTokens"))
+            total_tokens = (
+                _coerce_usage_int(last.get("totalTokens"))
+                or prompt_tokens + completion_tokens
+            )
+            compressor.last_prompt_tokens = prompt_tokens
+            compressor.last_completion_tokens = completion_tokens
+            compressor.last_total_tokens = total_tokens
+            if prompt_tokens > 0:
+                compressor.last_real_prompt_tokens = prompt_tokens
+        context_window = token_usage.get("modelContextWindow")
+        if isinstance(context_window, int) and context_window > 0:
+            compressor.context_length = context_window
+
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
         live TUI tool card correlates with the same tool call after the
@@ -657,6 +879,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}
+        if method == "thread/tokenUsage/updated":
+            _refresh_live_token_usage(params)
+            return
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return
@@ -758,8 +983,25 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        context_window = getattr(
+            getattr(agent, "context_compressor", None),
+            "context_length",
+            None,
+        ) or getattr(agent, "_config_context_length", None)
+        configured_context_window = getattr(
+            agent, "_config_context_length", None
+        )
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_extra_args=_codex_app_server_launch_args(
+                str(getattr(agent, "model", "") or ""),
+                configured_context_window,
+            ),
+            resume_thread_id=_load_codex_thread_id(agent),
+            recovery_context=_build_codex_recovery_context(
+                messages,
+                context_window,
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -777,7 +1019,12 @@ def run_codex_app_server_turn(
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
-        # respawns from scratch instead of reusing a dead client.
+        # respawns and resumes the same durable Codex thread instead of
+        # reusing a dead client or silently starting without history.
+        _persist_codex_thread_id(
+            agent,
+            getattr(agent._codex_session, "resumable_thread_id", None),
+        )
         try:
             agent._codex_session.close()
         except Exception:
@@ -811,6 +1058,18 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
+    # Persist before retirement. Watchdog/time-out turns carry the thread id
+    # even when they have no final response, and the replacement process must
+    # resume that exact rollout on the next Telegram turn.
+    _persist_codex_thread_id(
+        agent,
+        getattr(
+            agent._codex_session,
+            "resumable_thread_id",
+            getattr(turn, "thread_id", None),
+        ),
+    )
+
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
     # message-bearing compatibility interrupt can still be replayed by callers.
@@ -825,9 +1084,10 @@ def run_codex_app_server_turn(
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
-    # exited), retire the session so the next turn respawns codex
-    # rather than riding the broken process. Mirrors openclaw beta.8's
-    # "retire timed-out app-server clients" fix.
+    # exited), retire the process so the next turn respawns codex and resumes
+    # the persisted thread rather than riding the broken process or resetting
+    # the conversation. Mirrors openclaw beta.8's process-retirement fix while
+    # preserving Hermes' stronger continuity contract.
     if getattr(turn, "should_retire", False):
         logger.warning(
             "codex app-server session retired (turn error: %s)",

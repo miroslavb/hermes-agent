@@ -1551,6 +1551,24 @@ file will silently overwrite recent fixes on main when squashed. Verify
 with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
 red flag.
 
+### Codex app-server process retirement must preserve the thread
+Codex app-server is stateful even though Hermes may retire its subprocess
+after a timeout, watchdog event, gateway restart, or update. Persist the
+model-scoped thread id in the Hermes session before closing the process and
+use `thread/resume` in its replacement. If Codex no longer has the rollout,
+seed the fresh thread with a bounded transcript from canonical Hermes history;
+never continue with only the newest Telegram message.
+
+Context overrides are also subprocess launch policy: a profile-owned
+`model.context_length` must reach app-server as Codex CLI config, while the
+effective window reported by live token-usage events is display/accounting
+state, not the next launch request. Codex `cachedInputTokens` is a subset of
+`inputTokens`, not an additional prompt bucket. Profiles that explicitly own
+context policy show only real model slugs; synthetic `-900k` picker aliases
+remain available only when context policy is not pinned. The combined
+regression contour lives in
+`tests/run_agent/test_codex_app_server_integration.py`.
+
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
 unused module into a live code path, E2E test the real resolution chain

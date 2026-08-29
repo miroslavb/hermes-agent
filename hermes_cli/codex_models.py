@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import os
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +117,36 @@ def _add_context_variants(model_ids: List[str]) -> List[str]:
     return out
 
 
+def _profile_owns_context_policy() -> bool:
+    """True when this profile explicitly selects its model context window.
+
+    ``-900k`` aliases exist only as a context opt-in. Showing both aliases
+    after the operator has already pinned ``model.context_length`` creates two
+    visually duplicated model entries whose suffix cannot override that pin.
+    Respect the profile-owned policy and keep one real model slug in that case.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        config_path = Path(get_hermes_home()) / "config.yaml"
+        if not config_path.exists():
+            return False
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        model_cfg = payload.get("model") if isinstance(payload, dict) else None
+        value = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+        if isinstance(value, bool):
+            return False
+        return int(value) > 0
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return False
+
+
 def _finalize_codex_models(model_ids: List[str]) -> List[str]:
     """Forward-compat synthesis + large-context variant synthesis."""
-    return _add_context_variants(_add_forward_compat_models(model_ids))
+    models = _add_forward_compat_models(model_ids)
+    if _profile_owns_context_policy():
+        return models
+    return _add_context_variants(models)
 
 
 def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
