@@ -30041,13 +30041,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
                 return True
-            if previewed:
-                has_delivered_text = getattr(consumer, "has_delivered_text", None)
-                if callable(has_delivered_text):
-                    try:
-                        return bool(has_delivered_text(final_text))
-                    except Exception:
-                        return False
+            # Codex app-server emits every completed agentMessage through the
+            # interim callback because it cannot know whether another tool/item
+            # follows until the turn terminates.  The terminal agentMessage can
+            # therefore already be visible even though response_previewed stays
+            # False.  Exact delivered-text identity is stronger evidence than
+            # that producer-side hint and cannot confuse unrelated commentary
+            # with the final response.
+            has_delivered_text = getattr(consumer, "has_delivered_text", None)
+            if callable(has_delivered_text):
+                try:
+                    return bool(has_delivered_text(final_text))
+                except Exception:
+                    return False
             return False
 
         try:

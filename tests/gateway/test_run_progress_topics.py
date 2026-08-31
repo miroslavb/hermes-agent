@@ -831,6 +831,26 @@ class PreviewedResponseAgent:
         }
 
 
+class CodexTerminalMessageAsInterimAgent:
+    """Mirror app-server's terminal agentMessage callback shape."""
+
+    FINAL = "This final answer was already delivered by the interim callback."
+
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback(self.FINAL, already_streamed=False)
+        return {
+            "final_response": self.FINAL,
+            "response_previewed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedSplitAfterCommentaryAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1181,6 +1201,35 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_exact_terminal_interim_delivery_suppresses_normal_final_send(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CodexTerminalMessageAsInterimAgent,
+        session_id="sess-codex-terminal-interim",
+        config_data={
+            "display": {
+                "interim_assistant_messages": True,
+                "platforms": {"telegram": {"streaming": True}},
+            },
+            "streaming": {
+                "enabled": False,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert [call["content"] for call in adapter.sent] == [
+        CodexTerminalMessageAsInterimAgent.FINAL
+    ]
+    assert result.get("already_sent") is True
 
 
 class TransformedStreamAgent:

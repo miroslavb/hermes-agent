@@ -1505,7 +1505,7 @@ guards and be dispatched inline, not via `_process_message_background()`
 ### Streaming delivery contract (stream-is-the-message adapters) — duplicate-final class
 Adapters with `draft_stream_is_message = True` (relay Slack native streaming)
 keep ONE cumulative native stream per turn; the stream IS the final message.
-Four invariants, each learned from a live duplicate-final incident (NS-658
+Five invariants, each learned from a live duplicate-final incident (NS-658
 canary ledger, hermes#85796 / gateway-gateway#210). Violating any of them
 re-creates a duplicate or a frozen stream:
 
@@ -1534,8 +1534,18 @@ re-creates a duplicate or a frozen stream:
    exists. A sealed native stream is a regular message — `chat.update` on it
    works (live-verified).
 
-Contract tests: `tests/gateway/test_stream_final_contract.py` (all four
-invariants, mutation-checked). Slack streaming API ground truth (live-probed,
+5. **Exact delivered text outranks producer preview flags.** Codex app-server
+   must expose completed `agentMessage` items as interim candidates because a
+   later tool may still follow; its terminal message can therefore reach chat
+   while `response_previewed=False`. Before a normal final send, exact
+   `has_delivered_text(final_response)` identity suppresses the duplicate body
+   (the optional runtime footer may follow separately). Unrelated commentary
+   never suppresses because it does not match the completed final text.
+
+Contract tests: `tests/gateway/test_stream_final_contract.py` (the first four,
+mutation-checked) plus
+`tests/gateway/test_run_progress_topics.py::test_exact_terminal_interim_delivery_suppresses_normal_final_send`
+for exact terminal-message identity. Slack streaming API ground truth (live-probed,
 also encoded in connector comments/tests): `chat.*Stream` speaks STANDARD
 markdown, not mrkdwn; `stopStream.markdown_text` APPENDS (never replaces);
 `startStream`/`stopStream` are rate-limit Tier 2 (~20/min).
