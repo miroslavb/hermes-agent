@@ -38,6 +38,7 @@ class FakeClient:
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
         self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self.thread_read_result: dict = {}
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
@@ -59,6 +60,8 @@ class FakeClient:
             return {}
         if method == "turn/steer":
             return {"turnId": (params or {}).get("expectedTurnId")}
+        if method == "thread/read":
+            return self.thread_read_result
         return {}
 
     def notify(self, method: str, params=None):
@@ -705,10 +708,18 @@ class TestSessionRetirement:
 
 
     def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
+        """A missed completion notification is recoverable only when
+        thread/read confirms that the turn itself reached a terminal state.
         """
         client = FakeClient()
+        client.thread_read_result = {
+            "thread": {
+                "id": "thread-fake-001",
+                "turns": [
+                    {"id": "turn-fake-001", "status": "completed"},
+                ],
+            },
+        }
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "done"},
@@ -724,11 +735,178 @@ class TestSessionRetirement:
         assert r.final_text == "done"
         assert r.interrupted is False
         assert r.error is None
-        assert r.should_retire is False
+        assert r.should_retire is True
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
+        assert any(method == "thread/read" for method, _ in client.requests)
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_agent_message_is_not_final_while_thread_read_reports_running(self):
+        """An item/completed agentMessage can be interim commentary.  Without
+        turn/completed, a still-running turn must fail partial instead of being
+        relabelled as a successful final answer.
+        """
+        client = FakeClient()
+        client.thread_read_result = {
+            "thread": {
+                "id": "thread-fake-001",
+                "turns": [
+                    {"id": "turn-fake-001", "status": "inProgress"},
+                ],
+            },
+        }
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "text": "Still working; next I will inspect the ledger.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "finish the audit",
+            turn_timeout=0.02,
+            notification_poll_timeout=0.005,
+        )
+        assert r.final_text.startswith("Still working")
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "turn/completed" in r.error
+        assert any(method == "thread/read" for method, _ in client.requests)
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_productive_activity_extends_turn_timeout_until_completion(self):
+        """The turn timeout is an inactivity bound, not a wall-clock cap.
+
+        Four useful events arrive four seconds apart.  The whole turn lasts
+        longer than the five-second timeout but never stays idle for five
+        seconds, so the terminal answer must still be consumed.
+        """
+        clock = [0.0]
+
+        class AdvancingClient(FakeClient):
+            def take_notification(self, timeout: float = 0.0):
+                if self._notifications:
+                    clock[0] += 4.0
+                    return self._notifications.pop(0)
+                return None
+
+        client = AdvancingClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "collect-ledger",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "page 1",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "text": "Collected the first page; continuing.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m2", "text": "Audit complete."},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            r = s.run_turn(
+                "finish the audit",
+                turn_timeout=5.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=5.0,
+            )
+        assert r.final_text == "Audit complete."
+        assert r.interrupted is False
+        assert r.error is None
+        assert not any(method == "thread/read" for method, _ in client.requests)
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_default_post_tool_silence_does_not_preempt_long_reasoning(self):
+        """Silence after a large tool result is not proof of a wedged turn.
+
+        Codex may spend more than 90 seconds reasoning over one result without
+        another notification.  The default path must leave that turn to the
+        general inactivity deadline instead of applying a shorter hidden cap.
+        """
+        clock = [0.0]
+
+        class LongReasoningClient(FakeClient):
+            notification_reads = 0
+
+            def take_notification(self, timeout: float = 0.0):
+                self.notification_reads += 1
+                if self.notification_reads == 1:
+                    return self._notifications.pop(0)
+                if self.notification_reads == 2:
+                    clock[0] = 120.0
+                    return None
+                if self._notifications:
+                    return self._notifications.pop(0)
+                return None
+
+        client = LongReasoningClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex-large",
+                "command": "collect-large-ledger",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "large ledger ready",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "Audit complete."},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            r = s.run_turn(
+                "finish the large audit",
+                turn_timeout=600.0,
+                notification_poll_timeout=0.0,
+            )
+        assert r.final_text == "Audit complete."
+        assert r.interrupted is False
+        assert r.error is None
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
 
@@ -895,4 +1073,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

@@ -1559,6 +1559,21 @@ use `thread/resume` in its replacement. If Codex no longer has the rollout,
 seed the fresh thread with a bounded transcript from canonical Hermes history;
 never continue with only the newest Telegram message.
 
+The per-turn timeout is an inactivity bound, not an absolute wall-clock cap:
+refresh it on every in-scope app-server notification or server request so a
+productive tool-heavy turn can continue past ten minutes. Only
+`turn/completed`, or a matching terminal turn returned by
+`thread/read(includeTurns=true)`, proves the turn finished. An
+`item/completed` `agentMessage` proves only that one message item finished;
+Codex can emit several progress messages in the same turn. Never promote one
+to a successful final response merely because a deadline elapsed. If stored
+turn state is still running or cannot be proved terminal, interrupt, return a
+partial failure, retire the process, and preserve its thread for recovery.
+Do not enable a shorter post-tool silence watchdog by default: after a large
+tool result, Codex can legitimately spend more than 90 seconds reasoning with
+no new item notification. Explicitly bounded callers may still opt into that
+stricter watchdog; the normal path relies on the general inactivity bound.
+
 Context overrides are also subprocess launch policy: a profile-owned
 `model.context_length` must reach app-server as Codex CLI config, while the
 effective window reported by live token-usage events is display/accounting

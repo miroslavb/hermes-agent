@@ -533,17 +533,24 @@ class CodexAppServerSession:
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
-        post_tool_quiet_timeout: float = 90.0,
+        post_tool_quiet_timeout: Optional[float] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
 
-        post_tool_quiet_timeout: if codex emits a tool completion and then
-        goes quiet for this many seconds without emitting another item or
-        `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
-        so a wedged codex doesn't burn the full turn deadline.
+        ``turn_timeout`` is an inactivity bound, not a wall-clock cap.  Every
+        in-scope Codex notification or server request refreshes it so a
+        productive tool-heavy turn can run for hours.  Only
+        ``turn/completed`` (or a terminal status confirmed by ``thread/read``)
+        makes assistant text final; ``item/completed`` closes one item and can
+        be emitted many times during the same turn.
+
+        post_tool_quiet_timeout: optional stricter post-tool watchdog for
+        explicitly bounded callers. Disabled by default because silence after
+        a large tool result is not proof of a wedge: Codex can legitimately
+        reason for more than 90 seconds before emitting its next item. The
+        general inactivity deadline still bounds a genuinely silent turn.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -640,7 +647,7 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+        idle_deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -648,7 +655,7 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while time.monotonic() < idle_deadline and not turn_complete:
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -675,7 +682,8 @@ class CodexAppServerSession:
             # signal and codex has been silent past the quiet timeout, give
             # up on this turn instead of waiting for the outer deadline.
             if (
-                last_tool_completion_at is not None
+                post_tool_quiet_timeout is not None
+                and last_tool_completion_at is not None
                 and (time.monotonic() - last_tool_completion_at)
                     > post_tool_quiet_timeout
             ):
@@ -693,6 +701,7 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                idle_deadline = time.monotonic() + turn_timeout
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -712,6 +721,8 @@ class CodexAppServerSession:
                             pending.get("method"),
                         )
                         continue
+                    notification_at = time.monotonic()
+                    idle_deadline = notification_at + turn_timeout
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -734,7 +745,7 @@ class CodexAppServerSession:
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
-                        last_tool_completion_at = time.monotonic()
+                        last_tool_completion_at = notification_at
                     if proj.final_text is not None:
                         result.final_text = proj.final_text
                         if _has_turn_aborted_marker(proj.final_text):
@@ -767,6 +778,9 @@ class CodexAppServerSession:
                 )
                 continue
 
+            notification_at = time.monotonic()
+            idle_deadline = notification_at + turn_timeout
+
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -790,7 +804,7 @@ class CodexAppServerSession:
                 result.tool_iterations += 1
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
-                last_tool_completion_at = time.monotonic()
+                last_tool_completion_at = notification_at
             else:
                 # Any non-tool projected activity (assistant message,
                 # status update, etc.) means codex is still producing
@@ -838,29 +852,50 @@ class CodexAppServerSession:
                                 f"turn ended status={turn_status}", err_msg
                             )
 
-        if (
-            not turn_complete
-            and not result.interrupted
-            and result.final_text
-            and result.error is None
-        ):
-            logger.warning(
-                "codex app-server turn reached deadline after a completed "
-                "assistant message but before turn/completed; accepting "
-                "the assistant text as the terminal response"
-            )
-            turn_complete = True
+        if not turn_complete and not result.interrupted:
+            # A notification can be lost even though Codex durably completed
+            # the turn.  Recover that narrow case from the authoritative
+            # stored thread state.  Never infer turn completion from an
+            # agentMessage item: one turn can contain many completed messages,
+            # including progress commentary.
+            turn_state = self._read_turn_state(result.turn_id)
+            status = str((turn_state or {}).get("status") or "").lower()
+            normalized_status = status.replace("_", "").replace("-", "")
+            if normalized_status == "completed":
+                logger.warning(
+                    "codex app-server omitted turn/completed; thread/read "
+                    "confirmed completion, accepting the final assistant "
+                    "text and retiring the event stream"
+                )
+                turn_complete = True
+                result.should_retire = True
+            elif normalized_status in {"failed", "error"}:
+                err_obj = (turn_state or {}).get("error")
+                result.error = self._format_error_with_stderr(
+                    "turn failed without turn/completed",
+                    _format_responses_error(err_obj, status)
+                    if err_obj
+                    else status,
+                )
+                turn_complete = True
+                result.should_retire = True
+            elif normalized_status in {"interrupted", "cancelled", "canceled"}:
+                result.interrupted = True
+                result.error = "codex turn ended interrupted without turn/completed"
+                turn_complete = True
+                result.should_retire = True
 
         if not turn_complete and not result.interrupted:
-            # Hit the deadline. Issue interrupt to stop wasted compute, and
-            # tell the caller to retire the session — a turn that never
-            # finished is a strong sign codex is wedged in a way the next
-            # turn shouldn't inherit.
+            # The turn stayed idle through the deadline and thread/read did
+            # not prove a terminal state. Issue an interrupt and fail partial;
+            # the latest agentMessage is progress, not a successful final.
             self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s"
+                    "codex did not emit turn/completed after "
+                    f"{turn_timeout}s without activity; any assistant text "
+                    "from this turn remains partial"
                 )
             result.should_retire = True
 
@@ -868,6 +903,37 @@ class CodexAppServerSession:
             self._active_turn_id = None
         self._interrupt_event.clear()
         return result
+
+    def _read_turn_state(self, turn_id: Optional[str]) -> Optional[dict[str, Any]]:
+        """Read one stored Codex turn without changing thread lifecycle.
+
+        ``thread/read(includeTurns=True)`` is the protocol backstop for a
+        dropped ``turn/completed`` notification.  Returning ``None`` fails
+        closed: callers must not promote item-level assistant text to a final
+        response when the turn state cannot be proven.
+        """
+        if self._client is None or self._thread_id is None or not turn_id:
+            return None
+        try:
+            payload = self._client.request(
+                "thread/read",
+                {"threadId": self._thread_id, "includeTurns": True},
+                timeout=10,
+            )
+        except (CodexAppServerError, TimeoutError):
+            logger.warning(
+                "codex thread/read failed while confirming turn completion",
+                exc_info=True,
+            )
+            return None
+        thread = payload.get("thread") or {}
+        turns = thread.get("turns") or payload.get("turns") or []
+        if not isinstance(turns, list):
+            return None
+        for turn in turns:
+            if isinstance(turn, dict) and str(turn.get("id") or "") == str(turn_id):
+                return turn
+        return None
 
     def compact_thread(
         self,
