@@ -1534,18 +1534,22 @@ re-creates a duplicate or a frozen stream:
    exists. A sealed native stream is a regular message — `chat.update` on it
    works (live-verified).
 
-5. **Exact delivered text outranks producer preview flags.** Codex app-server
-   must expose completed `agentMessage` items as interim candidates because a
-   later tool may still follow; its terminal message can therefore reach chat
-   while `response_previewed=False`. Before a normal final send, exact
-   `has_delivered_text(final_response)` identity suppresses the duplicate body
-   (the optional runtime footer may follow separately). Unrelated commentary
-   never suppresses because it does not match the completed final text.
+5. **Codex message phases have one delivery owner.** Completed commentary
+   `agentMessage` items remain interim candidates because a later tool may
+   still follow. A completed `phase=final_answer` item is terminal, so its
+   deltas may animate the draft but the item itself must bypass the interim
+   callback and let the turn finalizer persist the answer once. Phase-less
+   items stay on the legacy interim path. Exact
+   `has_delivered_text(final_response)` identity remains a fallback for older
+   producers that cannot distinguish phases; unrelated commentary never
+   suppresses the final because its text does not match.
 
 Contract tests: `tests/gateway/test_stream_final_contract.py` (the first four,
 mutation-checked) plus
 `tests/gateway/test_run_progress_topics.py::test_exact_terminal_interim_delivery_suppresses_normal_final_send`
-for exact terminal-message identity. Slack streaming API ground truth (live-probed,
+for legacy terminal-message identity, plus
+`tests/agent/test_codex_app_server_event_bridge.py` for phase-aware routing.
+Slack streaming API ground truth (live-probed,
 also encoded in connector comments/tests): `chat.*Stream` speaks STANDARD
 markdown, not mrkdwn; `stopStream.markdown_text` APPENDS (never replaces);
 `startStream`/`stopStream` are rate-limit Tier 2 (~20/min).
