@@ -4,6 +4,16 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Sandbox false negatives
+
+- **Do not mistake sandbox loopback denial for gbrain downtime.** If a gbrain
+  MCP or CLI read fails with `ECONNREFUSED 127.0.0.1:5432` (or an equivalent
+  local PostgreSQL connection error) inside the filesystem/network sandbox,
+  immediately retry the same read-only call with approved out-of-sandbox
+  access. Declare gbrain unavailable only if that retry also fails. Do not
+  start, restart, or otherwise mutate the database service merely to diagnose
+  the sandbox false negative.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
