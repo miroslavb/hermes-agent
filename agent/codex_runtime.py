@@ -120,8 +120,9 @@ def _codex_app_server_launch_args(
 
     The ``-900k`` picker suffix is Hermes-only. Explicit
     ``model.context_length`` is also Hermes-owned, and app-server otherwise
-    ignores it. Forward either opt-in to Codex at subprocess startup while
-    capping it at the live-verified window for the selected base slug.
+    ignores it. Forward either opt-in to Codex at subprocess startup. Keep the
+    live-verified cap for legacy models we have measured, but do not let that
+    allowlist discard an explicit profile setting for a newer model.
     """
     from agent.model_metadata import (
         CODEX_CONTEXT_VARIANT_SUFFIX,
@@ -137,16 +138,19 @@ def _codex_app_server_launch_args(
     verified_context = _verified_codex_ctx_for_slug(
         f"{wire_model}{CODEX_CONTEXT_VARIANT_SUFFIX}"
     )
-    if not verified_context or not is_codex_900k_base(wire_model):
-        return []
-
     if is_codex_context_variant(model):
+        if not verified_context or not is_codex_900k_base(wire_model):
+            return []
         context_window = verified_context
     else:
         requested = _coerce_usage_int(configured_context_length)
         if requested <= 272_000:
             return []
-        context_window = min(requested, verified_context)
+        context_window = (
+            min(requested, verified_context)
+            if verified_context and is_codex_900k_base(wire_model)
+            else requested
+        )
 
     compact_limit = int(context_window * 0.90)
     return [

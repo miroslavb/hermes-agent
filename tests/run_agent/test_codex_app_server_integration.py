@@ -915,6 +915,14 @@ class TestCodexContextContinuity:
     """Regression contour for context lost after app-server retirement."""
 
     def test_large_context_profile_is_forwarded_to_app_server(self):
+        assert _codex_app_server_launch_args("gpt-6-astra", 1_000_000) == [
+            "-c",
+            'model="gpt-6-astra"',
+            "-c",
+            "model_context_window=1000000",
+            "-c",
+            "model_auto_compact_token_limit=900000",
+        ]
         assert _codex_app_server_launch_args("gpt-5.6-sol", 1_000_000) == [
             "-c",
             'model="gpt-5.6-sol"',
@@ -1088,9 +1096,10 @@ class TestCodexContextContinuity:
             _Session,
         )
         db = _ThreadStateDB(
-            {"thread_id": "thread-old", "model": "gpt-5.6-sol"}
+            {"thread_id": "thread-old", "model": "gpt-6-astra"}
         )
         agent = _continuity_agent(
+            model="gpt-6-astra",
             _session_db=db,
             _codex_session=None,
             _config_context_length=1_000_000,
@@ -1125,7 +1134,7 @@ class TestCodexContextContinuity:
         assert result["final_response"] == "continued"
         assert captured["resume_thread_id"] == "thread-old"
         assert "Build Pearl Hopper" in captured["recovery_context"]
-        assert "model_context_window=900000" in captured["codex_extra_args"]
+        assert "model_context_window=1000000" in captured["codex_extra_args"]
         assert captured["user_input"] == "Status?"
         thread_state = db.patches[-1][1]["_codex_app_server_thread"]
         assert thread_state["thread_id"] == "thread-old"
