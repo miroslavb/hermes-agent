@@ -1479,6 +1479,10 @@ def build_turn_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+            # A rotated/compacted main session also has a parent. Supply the
+            # actual execution role so memory plugins do not skip its rehydrate.
+            is_worker=(getattr(agent, "_delegate_depth", 0) > 0
+                       or hasattr(agent, "_review_input_token_budget")),
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []

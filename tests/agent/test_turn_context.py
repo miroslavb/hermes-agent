@@ -214,6 +214,21 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+@pytest.mark.parametrize("depth,review,expected", [(0, False, False), (1, False, True), (0, True, True)])
+def test_memory_hook_role_distinguishes_compaction_parent_from_worker(depth, review, expected):
+    agent = _FakeAgent()
+    agent._parent_session_id = "parent-or-compaction-lineage"
+    agent._delegate_depth = depth
+    if review:
+        agent._review_input_token_budget = None
+    with patch("hermes_cli.lifecycle.invoke_hook", return_value=[]) as hook:
+        _build(agent)
+    calls = [c for c in hook.call_args_list if c.args[0] == "pre_llm_call"]
+    assert len(calls) == 1
+    assert calls[0].kwargs["is_worker"] is expected
+    assert calls[0].kwargs["parent_session_id"] == "parent-or-compaction-lineage"
+
+
 def test_preflight_timeout_stops_turn_before_provider_boundary():
     """An unchanged oversized payload must not escape turn construction."""
     agent = _FakeAgent()

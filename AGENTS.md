@@ -6,6 +6,10 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ## Sandbox false negatives
 
+- `pre_llm_call.is_worker` reports delegation/background review, independent
+  of parent-session lineage. A compaction successor must retain the main
+  owner's context rehydration. Plugins keep principal/profile/offline gates.
+
 - **Do not mistake sandbox loopback denial for gbrain downtime.** If a gbrain
   MCP or CLI read fails with `ECONNREFUSED 127.0.0.1:5432` (or an equivalent
   local PostgreSQL connection error) inside the filesystem/network sandbox,
