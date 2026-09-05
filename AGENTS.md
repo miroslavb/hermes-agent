@@ -1839,3 +1839,13 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## Completion policy parity
+
+Normal and Codex app-server conversations support the generic `pre_turn_complete`
+hook for material decisions with no file mutations. One optional continuation is
+allowed; interrupts/errors never produce successful completion receipts. The
+Codex current input includes the same composed plugin/prefetch context as its
+persisted api_content sidecar. `pre_api_request` on this transport explicitly
+uses request_scope=runtime_turn, not an assertion about internal model requests.
+Preserve clean user content, durable thread continuity and single final delivery.

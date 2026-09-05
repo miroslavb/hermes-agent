@@ -458,3 +458,16 @@ If you find a bug, [open an issue](https://github.com/NousResearch/hermes-agent/
 ```
 
 For implementation details, see [PR #24182](https://github.com/NousResearch/hermes-agent/pull/24182) and the [Codex app-server protocol README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
+
+## Plugin context and completion policy
+
+Hermes sends per-turn plugin context and memory prefetch with the current Codex
+input, retaining clean user content and a composed `api_content` sidecar.
+`pre_api_request` observes the exact `turn/start` input including recovery, with
+`request_scope="runtime_turn"`. Internal Codex provider requests are not visible.
+
+The optional `pre_turn_complete` hook can request one continuation, including
+turns with no file changes. It continues the same durable thread. Only the nudge
+is synthetic; candidate answers remain real transcript evidence. `post_llm_call`
+fires once for the final successful result, never on interruption or error.
+A receipt establishes dispatch or completion, not semantic policy compliance.

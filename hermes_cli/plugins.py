@@ -189,6 +189,7 @@ VALID_HOOKS: Set[str] = {
     # verification-stop nudge; this hook is for user/plugin policy and is
     # bounded by agent.max_verify_nudges.
     "pre_verify",
+    "pre_turn_complete",  # Any successful turn; one optional policy continuation.
     "pre_api_request",
     "post_api_request",
     "api_request_error",
@@ -434,6 +435,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "post_api_request",
     "api_request_error",
     "pre_verify",
+    "pre_turn_complete",  # Any successful turn; one optional policy continuation.
     "on_session_start",
     "on_session_end",
 }

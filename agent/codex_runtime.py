@@ -928,6 +928,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    turn_id: str = "",
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -1030,8 +1031,46 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    from agent.completion_hooks import completion_continue_message
+    from hermes_cli.lifecycle import invoke_hook
+
+    runtime_turns = []
+    projected = []
+
+    def observe_dispatch(params):
+        invoke_hook(
+            "pre_api_request", session_id=agent.session_id,
+            task_id=effective_task_id, turn_id=turn_id,
+            api_request_id=f"{turn_id}:codex:{len(runtime_turns)}",
+            model=agent.model, platform=getattr(agent, "platform", "") or "",
+            request_scope="runtime_turn", runtime="codex_app_server",
+            request_messages=[{"role": "user", "content": params["input"][0]["text"]}],
+            system_prompt="", api_call_count=len(runtime_turns) + 1,
+        )
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        pending_input = user_message
+        for attempt in range(2):
+            turn = agent._codex_session.run_turn(
+                user_input=pending_input, on_dispatch=observe_dispatch,
+            )
+            runtime_turns.append(turn)
+            projected.extend(turn.projected_messages or [])
+            if turn.interrupted or turn.error is not None or not turn.final_text:
+                break
+            nudge = completion_continue_message(
+                agent, turn_id=turn_id, user_message=original_user_message,
+                final_response=turn.final_text, attempt=attempt,
+            )
+            if not nudge:
+                break
+            # The candidate has already streamed; preserve it as real interim
+            # evidence. Only the internal continuation is synthetic. Continue
+            # the SAME durable Codex thread, never reset/replay the user turn.
+            projected.append({"role": "user", "content": nudge,
+                              "_pre_verify_synthetic": True})
+            pending_input = nudge
+        turn.projected_messages = projected
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -1169,11 +1208,20 @@ def run_codex_app_server_turn(
     # chat_completions loop bumps it per tool iteration (line ~12110)
     # and that loop is bypassed on this path.
     agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+        getattr(agent, "_iters_since_skill", 0) + sum(t.tool_iterations for t in runtime_turns)
     )
-    _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    usage_result = {}
+    usage_totals = {}
+    for observed_turn in runtime_turns:
+        _record_codex_app_server_compaction(agent, observed_turn)
+        usage_result = _record_codex_app_server_usage(agent, observed_turn)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens",
+                    "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+                    "estimated_cost_usd"):
+            if isinstance(usage_result.get(key), (int, float)):
+                usage_totals[key] = usage_totals.get(key, 0) + usage_result[key]
+    usage_result.update(usage_totals)
+    api_calls = len(runtime_turns)
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
@@ -1198,6 +1246,19 @@ def run_codex_app_server_turn(
             )
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
+
+    if turn.final_text and not turn.interrupted and turn.error is None:
+        try:
+            invoke_hook(
+                "post_llm_call", session_id=agent.session_id,
+                task_id=effective_task_id, turn_id=turn_id,
+                user_message=original_user_message, assistant_response=turn.final_text,
+                conversation_history=list(messages), model=agent.model,
+                platform=getattr(agent, "platform", "") or "",
+                runtime="codex_app_server",
+            )
+        except Exception:
+            logger.warning("Codex completion observer failed", exc_info=True)
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND

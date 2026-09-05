@@ -1080,7 +1080,7 @@ class TestCodexContextContinuity:
                 captured.update(kwargs)
                 self.thread_id = kwargs.get("resume_thread_id")
 
-            def run_turn(self, user_input):
+            def run_turn(self, user_input, **kwargs):
                 captured["user_input"] = user_input
                 return TurnResult(
                     final_text="continued",

@@ -532,6 +532,7 @@ class CodexAppServerSession:
         user_input: Any,
         *,
         turn_timeout: float = 600.0,
+        on_dispatch: Optional[Callable[[dict], None]] = None,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: Optional[float] = None,
     ) -> TurnResult:
@@ -602,6 +603,14 @@ class CodexAppServerSession:
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
         try:
+            if on_dispatch is not None:
+                # Observe the exact composed input, including recovery. This is
+                # a runtime dispatch, not an internal Codex provider request.
+                try:
+                    on_dispatch({"threadId": self._thread_id,
+                                 "input": [{"type": "text", "text": user_input_text}]})
+                except Exception:
+                    logger.warning("Codex dispatch observer failed", exc_info=True)
             ts = self._client.request(
                 "turn/start",
                 {

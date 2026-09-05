@@ -2278,8 +2278,12 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        delegated_input = compose_user_api_content(
+            user_message, _ext_prefetch_cache, _plugin_user_context
+        ) or user_message
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=delegated_input,
+            turn_id=turn_id,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
@@ -9040,6 +9044,13 @@ def run_conversation(
                 except Exception:
                     logger.debug("pre_verify hook check failed", exc_info=True)
                     _verify_nudge2 = None
+
+                if not _verify_nudge2:
+                    from agent.completion_hooks import completion_continue_message
+                    _verify_nudge2 = completion_continue_message(
+                        agent, turn_id=turn_id, user_message=original_user_message,
+                        final_response=final_response, attempt=_attempt,
+                    )
 
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1

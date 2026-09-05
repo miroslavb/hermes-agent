@@ -1073,3 +1073,19 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
+
+
+def test_dispatch_observer_sees_exact_recovery_input_without_mutating_wire():
+    client = FakeClient()
+    client.queue_notification("turn/completed", threadId="t", turn={"id":"tu1", "status":"completed", "error":None})
+    session = make_session(client, recovery_context="earlier transcript")
+    seen = []
+    def observe(params):
+        seen.append(params["input"][0]["text"])
+        params["input"][0]["text"] = "observer mutation must not affect dispatch"
+    result = session.run_turn("current <policy>scope</policy>", on_dispatch=observe, turn_timeout=2)
+    sent = next(params for method, params in client.requests if method == "turn/start")
+    assert seen == [sent["input"][0]["text"]]
+    assert "earlier transcript" in seen[0]
+    assert "current <policy>scope</policy>" in seen[0]
+    assert result.error is None
