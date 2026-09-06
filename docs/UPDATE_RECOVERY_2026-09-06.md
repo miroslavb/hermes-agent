@@ -46,9 +46,14 @@ The broad staging run completed 3,747 files: 45,373 passed, 143 failed,
 This is not a green full suite. Four observed failures were subsequently
 resolved/validated by the focused run (the intended Codex sidecar contract,
 config read ownership, delegated policy, and temporary unmerged-index duplicate
-paths). Other failures are being compared with the same pinned pure upstream
-in the same Python environment; see `upstream-baseline*.log` and the machine
-comparison receipt. The shared production Python environment was not modified.
+paths). All remaining 139 broad-run failure identifiers reproduced on pure
+upstream in the same Python environment. A longer updater-file retest returned
+41 passed / 6 failed on both staging and pure upstream, with identical failing
+identifiers. No unclassified integration-only failure remained in this measured
+set. This comparison does not turn either full suite green or prove the absence
+of real upstream bugs. Evidence: `verification-summary.json` and
+`upstream-baseline*.log` in the private receipt directory. The shared production
+Python environment was not modified.
 
 A separate active Telegram session is applying and testing Codex/Hermes
 approval repairs in production after the baseline commit. Its uncommitted
