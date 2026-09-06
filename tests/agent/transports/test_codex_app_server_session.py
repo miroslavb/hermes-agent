@@ -776,7 +776,7 @@ class TestSessionRetirement:
         assert r.final_text.startswith("Still working")
         assert r.interrupted is True
         assert r.should_retire is True
-        assert r.error and "turn/completed" in r.error
+        assert r.error and "timed out" in r.error
         assert any(method == "thread/read" for method, _ in client.requests)
         assert any(method == "turn/interrupt" for method, _ in client.requests)
 
@@ -911,7 +911,16 @@ class TestSessionRetirement:
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
-        client = FakeClient()
+        clock = [1000.0]
+
+        class QuietClient(FakeClient):
+            def take_notification(self, timeout: float = 0.0):
+                if self._notifications:
+                    return self._notifications.pop(0)
+                clock[0] += 0.2
+                return None
+
+        client = QuietClient()
         client.queue_notification(
             "item/completed",
             item={
@@ -923,11 +932,12 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        # Advance by observable empty polls, not the implementation's count
+        # of monotonic() calls (the shared drive loop may sample more often).
         with patch.object(
             session_mod.time,
             "monotonic",
-            side_effect=lambda: next(monotonic_values),
+            side_effect=lambda: clock[0],
         ):
             r = s.run_turn(
                 "tool then silence",
