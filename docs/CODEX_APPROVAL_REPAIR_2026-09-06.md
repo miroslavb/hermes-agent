@@ -1,55 +1,58 @@
-# Codex → Hermes approvals: tested draft, application blocked
+# Codex → Hermes approvals: applied and verified
 
-The operator explicitly requested repair after enabling Hermes manual approvals.
-The production routing code, Codex reviewer config and gateway process were not
-changed in this repair task. Two attempts to change the live routing code were
-rejected by auto_review, including the exact tested patch. The reviewer classified
-conversation authorization as untrusted transcript content. Do not repeat the
-same user-consent question or apply the patch through an alternative path.
+## Current architecture
 
-## Verified defects
+The default profile now uses `model.openai_runtime: auto`. With the configured
+`openai-codex` provider, runtime resolution selects the direct
+`codex_responses` path: Hermes owns the agent loop and tools. Codex app-server
+is retained only as an opt-in runtime.
 
-1. Codex runtime obtained only the CLI thread-local callback. A real AIAgent
-   regression with a registered gateway listener reproduced callback=None.
-2. Hermes bypass flags were captured at Codex session creation, so a reused
-   transport could retain an old mode after /approvals changed.
-3. Telegram bound cards to a session and resolved FIFO. A real adapter/queue
-   test reproduced an expired card approving a NEW queued request.
+The direct OpenAI smoke returned `HERMES_DIRECT_OK` at
+2026-09-06 22:28:39 UTC. The gateway entered its new process at 22:33:11 UTC,
+and a later Telegram session was observed in `agent.conversation_loop` without
+a Codex app-server thread start.
 
-## Proposed repair
+## Repaired defects in the opt-in runtime
 
-repair.patch and manifest.json contain the exact reviewed scope. The isolated
-copy is review/. It routes pending exec/fileChange requests through the shared
-Hermes queue, checks current mode/listener per request, and offers only once/deny.
-It binds Telegram cards to request ID, chat, message ID and offered choices.
-Missing UI, send errors, timeout, interruption and foreign/stale responses deny.
-CLI retains its registered prompt path; unattended manual contexts deny.
-Existing explicit off/yolo preference semantics remain request-scoped; no real
-config was edited and no runtime rejection is overridden by the patch.
+1. Codex execution and file-change approval requests now route through the
+   shared Hermes runtime approval queue when a gateway listener exists.
+2. Approval mode and listener availability are evaluated for every request,
+   instead of persisting a bypass decision for the transport lifetime.
+3. Telegram approval cards bind to request ID, chat ID, message ID and offered
+   choices. Foreign, stale or malformed callbacks cannot resolve a later FIFO
+   request.
+4. Missing UI, send errors, timeout, interruption, missing listeners and
+   invalid responses fail closed. CLI keeps its registered prompt path;
+   unattended manual contexts deny.
 
-## Evidence
+The patch does not enable Codex app-server, alter Codex `auto_review`, remove
+Codex credentials, or broaden an approval beyond the specific request.
 
-- final-tests.txt: 144 passed in 24.41 seconds in an isolated checkout.
-- telegram-baseline.txt: old card resolved the new command (reproduced).
-- combined-tests.txt and boundary-tests.txt: intermediate focused checks.
-- Tests exercise real queue + Codex protocol + Telegram adapter/callback.
-  Network/SDK card boundary and policy source are test doubles; live Telegram
-  delivery and a real app-server approval round trip were not exercised.
-- Production checkout no longer contains the deliberately failing reproduction;
-  the standalone patch includes it and its final passing form.
-- The patch does not modify Codex auto_review or permission configuration.
+## Verification
 
-## Remaining work
+- Exact prepared patch applied cleanly; reverse-check and `git diff --check`
+  passed on the live checkout.
+- Newest focused suite on the final live tree: `115 passed in 17.37s`.
+  The earlier isolated patch validation had `144/144` passing cases.
+- A repo-wide run was not accepted as regression evidence: it began producing
+  mass environment-level errors after a temporary `HERMES_HOME/logs` directory
+  disappeared and was stopped. This does not replace or weaken the focused
+  suite, and it is not reported as a clean full-suite result.
+- The suite covers the real queue, Codex protocol, Telegram adapter and callback
+  binding. Network/SDK boundaries remain test doubles in those unit tests.
+- A real direct-runtime Telegram approval was exercised safely. The target path
+  was proved absent, a `chmod 777` request produced the native approval card,
+  the operator selected `Run once`, execution returned the expected
+  `No such file or directory`, and the target remained absent afterward.
 
-Application needs acceptance by the governing approval mechanism. Once permitted,
-apply this exact scope with manifest checks; activate through the standard
-idle/drain gateway reload and verify a real native approval/denial round trip.
-The separate Codex auto_review can still reject before any UI request exists;
-this UI repair does not claim to reverse that decision. Hopper cron and its two
-reports remain uninstalled/unscheduled under the earlier explicit authorization.
-Sources: projects/hermes-agent, projects/pearl-hopper, infra/host-map.
+## Hopper follow-through
 
+The separately authorized allocation canary was installed at
+2026-09-06 22:48:17 UTC. A real system-cron tick added the second sample at
+22:50:01 UTC. The two reports are due at 23:48:17 UTC on 2026-09-06 and
+22:48:17 UTC on 2026-09-07. Delivery is deduplicated on success and retried on
+failure.
 
-## Runtime architecture clarification
-
-**Штатный runtime Hermes — настройка применена 2026-09-06 22:28 UTC; активация gateway после текущего ответа.** По прямому запросу оператора выполнена штатная команда hermes config set model.openai_runtime auto. Сохранены provider=openai-codex, модель по умолчанию gpt-5.6-terra, существующий OAuth, approvals.mode=manual, timeout=900 и cron_mode=deny. Настройки разрешений самого Codex не менялись. Реальный resolver выбрал codex_responses (source=device_code); короткий прямой Responses-запрос к настроенному OpenAI на gpt-5.6-terra без инструментов успешно вернул HERMES_DIRECT_OK, проверка 22:28:39 UTC. Текущий ответ ещё выполняется в ранее запущенном Codex; для новых агентов предусмотрен штатный reload gateway через SIGUSR1 с ожиданием завершения активной работы. Полный Telegram-ход с историей и инструментами пока не принят. Бинарник Codex, плагины и учётные данные сохранены. Патч ремонта Codex→Hermes approvals не применён; дефект устаревших Telegram-кнопок отдельно не исправлен. Cron и два отчёта Hopper пока не установлены. Следующий шаг: завершить штатную активацию, проверить следующий Telegram-ход и продолжить ранее разрешённую задачу Hopper при действующих подтверждениях. Доказательства: /root/.local/state/codex-approval-repair-20260906/direct-runtime-smoke.json и runtime-switch-state.md; config readback; hermes_cli/codex_runtime_switch.py, hermes_cli/runtime_provider.py, gateway/run.py:12864 и /etc/systemd/system/hermes-gateway.service. Связи [[projects/pearl-hopper]], [[projects/gbrain]].
+Local evidence remains under
+`/root/.local/state/codex-approval-repair-20260906/`. Canonical entities:
+`projects/hermes-agent`, `projects/pearl-hopper`, `infra/host-map`.

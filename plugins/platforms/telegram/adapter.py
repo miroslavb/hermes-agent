@@ -866,7 +866,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        self._approval_state: Dict[int, Dict[str, Any]] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -6583,8 +6583,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            # Bind the button to this exact queued operation and message.
+            # A timed-out card (or a reused counter after restart) must never
+            # resolve whichever newer command happens to be waiting now.
+            self._approval_state[approval_id] = {
+                "session_key": session_key,
+                "request_id": (metadata or {}).get("approval_request_id"),
+                "chat_id": str(normalize_telegram_chat_id(chat_id)),
+                "message_id": str(msg.message_id),
+                "choices": {"once", "deny"} | (
+                    ({"session", "always"} if allow_permanent else {"session"})
+                    if allow_session and not smart_denied else set()
+                ),
+            }
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -7534,10 +7545,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
-                    await query.answer(text="This approval has already been resolved.")
+                binding = self._approval_state.get(approval_id)
+                if not isinstance(binding, dict) or not binding.get("request_id"):
+                    self._approval_state.pop(approval_id, None)
+                    await query.answer(text="This approval has expired or already been resolved.")
                     return
+                if (str(query_chat_id) != binding["chat_id"]
+                        or str(getattr(query_message, "message_id", "")) != binding["message_id"]
+                        or choice not in binding["choices"]):
+                    await query.answer(text="This button does not match the approval request.")
+                    return
+                self._approval_state.pop(approval_id, None)
+                session_key = binding["session_key"]
 
                 user_display = getattr(query.from_user, "first_name", "User")
 
@@ -7549,7 +7568,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 # regression follow-up: 60s waits made stale taps common).
                 try:
                     from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    count = resolve_gateway_approval(
+                        session_key, choice, request_id=binding["request_id"]
+                    )
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,

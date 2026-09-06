@@ -185,7 +185,10 @@ class TestTelegramApprovalCallback:
         rest of a long-running turn after a button click.
         """
         adapter = _make_adapter()
-        adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state[5] = {
+            "session_key": "agent:main:telegram:group:12345:99", "request_id": "request-5",
+            "chat_id": "12345", "message_id": "42", "choices": {"once", "deny"},
+        }
         adapter.pause_typing_for_chat("12345")
         assert "12345" in adapter._typing_paused
 
@@ -193,6 +196,7 @@ class TestTelegramApprovalCallback:
         query.data = "ea:once:5"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.first_name = "Norbert"
         query.from_user.id = "12345"
@@ -213,12 +217,16 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_approval_callback_escapes_dynamic_user_name(self):
         adapter = _make_adapter()
-        adapter._approval_state[3] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state[3] = {
+            "session_key": "agent:main:telegram:group:12345:99", "request_id": "request-3",
+            "chat_id": "12345", "message_id": "42", "choices": {"once", "deny"},
+        }
 
         query = AsyncMock()
         query.data = "ea:once:3"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.first_name = "Alice_Bob"
         query.answer = AsyncMock()
@@ -248,6 +256,7 @@ class TestTelegramApprovalCallback:
         query.data = "update_prompt:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.id = 123
         query.answer = AsyncMock()
@@ -279,6 +288,7 @@ class TestTelegramApprovalCallback:
         query.data = "update_prompt:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.id = 222
         query.answer = AsyncMock()
@@ -307,6 +317,7 @@ class TestTelegramApprovalCallback:
         query.data = "update_prompt:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.message.chat.type = "private"
         query.from_user = MagicMock()
         query.from_user.id = 222

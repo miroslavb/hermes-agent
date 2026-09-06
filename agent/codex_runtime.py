@@ -972,35 +972,9 @@ def run_codex_app_server_turn(
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
-        # Approval callback: defer to Hermes' standard prompt flow if a
-        # CLI thread has installed one. Gateway / cron contexts get the
-        # codex-side fail-closed default.
-        try:
-            from tools.terminal_tool import _get_approval_callback
-            approval_callback = _get_approval_callback()
-        except Exception:
-            approval_callback = None
-
-        # Gateway / cron contexts have no UI to surface codex's approval
-        # requests through, so codex app-server exec / apply_patch requests
-        # fail closed (silently decline) by default. When the user has
-        # explicitly opted out of Hermes approvals — via `approvals.mode: off`
-        # in config, the /yolo session toggle, or --yolo / HERMES_YOLO_MODE —
-        # honor that and let codex's own sandbox permission profile
-        # (~/.codex/config.toml) be the policy gate instead of double-gating
-        # with a missing Hermes UI. Defaults (manual/smart/unset) preserve the
-        # current fail-closed behavior — this is a no-op for those users.
-        auto_approve_requests = False
-        try:
-            from tools.approval import is_approval_bypass_active
-
-            auto_approve_requests = is_approval_bypass_active()
-        except Exception:
-            logger.debug(
-                "codex app-server: approval-bypass lookup failed; "
-                "keeping fail-closed default",
-                exc_info=True,
-            )
+        # Resolve the current gateway/CLI UI and live mode on EACH request.
+        # This transport survives /approvals and /yolo changes across turns.
+        from tools.approval import request_runtime_approval
 
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
         # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
@@ -1028,11 +1002,8 @@ def run_codex_app_server_turn(
                 messages,
                 context_window,
             ),
-            approval_callback=approval_callback,
-            request_routing=_ServerRequestRouting(
-                auto_approve_exec=auto_approve_requests,
-                auto_approve_apply_patch=auto_approve_requests,
-            ),
+            approval_callback=request_runtime_approval,
+            request_routing=_ServerRequestRouting(),
             on_event=make_codex_app_server_event_bridge(agent),
         )
 

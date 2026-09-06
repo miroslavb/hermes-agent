@@ -1213,13 +1213,9 @@ class CodexAppServerSession:
         """Decide a Codex exec approval request.
 
         This is protocol-level routing only — it carries NO Hermes
-        approval-mode/timeout logic. The Hermes-side resolution happens
-        upstream: ``agent/codex_runtime.py`` derives
-        ``auto_approve_exec`` from the canonical
-        ``tools.approval.is_approval_bypass_active()`` (which reads
-        ``approvals.mode`` via ``tools.approval._get_approval_mode``),
-        and ``self._approval_callback`` itself runs the shared approval
-        gate (mode + ``approvals.timeout``) in ``tools/approval.py``.
+        approval-mode/timeout logic. The shared request_runtime_approval
+        callback checks live mode, selects the current session's UI, and
+        bounds the human wait through tools/approval.py.
         Keep it that way — do not re-read approval config here.
         """
         if self._routing.auto_approve_exec:

@@ -5880,6 +5880,64 @@ def check_execute_code_guard(code: str, env_type: str,
 # MCP elicitation entry point
 # =========================================================================
 
+def request_runtime_approval(
+    command: str, description: str, *, allow_permanent: bool = False,
+) -> str:
+    """Resolve a pending runtime request using the current Hermes session UI.
+
+    This single-operation prompt cannot override a runtime policy rejection.
+    Resolve mode and listener on every call, including on reused Codex threads.
+    """
+    if is_approval_bypass_active():
+        return "once"
+    if (_is_cron_approval_context() or _is_single_query_approval_context()
+            or _is_unattended_platform_approval_context()):
+        return "deny"
+    if _is_gateway_approval_context():
+        session_key = get_current_session_key(default="")
+        if not session_key:
+            return "deny"
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+        if notify_cb is None:
+            return "deny"
+        from agent.redact import redact_sensitive_text
+
+        # Different cwd/reason must not coalesce just because commands match.
+        key = "runtime_request:" + hashlib.sha256(
+            (command + "\0" + description).encode("utf-8")
+        ).hexdigest()
+        data = {
+            "command": redact_sensitive_text(command),
+            "description": redact_sensitive_text(description),
+            "pattern_key": key,
+            "pattern_keys": [key],
+            "allow_permanent": False,
+            "allow_session": False,
+        }
+        try:
+            decision = _await_gateway_decision(
+                session_key, notify_cb, data, surface="runtime-request",
+            )
+        except Exception:
+            logger.exception("Runtime approval dispatch failed")
+            return "deny"
+        return "once" if (
+            decision.get("resolved") and not decision.get("notify_failed")
+            and decision.get("choice") == "once"
+        ) else "deny"
+    # Never read stdin on a headless runtime; look up the current CLI/TUI
+    # callback instead of retaining a callback from an earlier worker thread.
+    callback = _resolve_cli_approval_callback()
+    if callback is None:
+        return "deny"
+    choice = prompt_dangerous_approval(
+        command, description, allow_permanent=False, allow_session=False,
+        approval_callback=callback,
+    )
+    return "once" if choice == "once" else "deny"
+
+
 def request_elicitation_consent(
     message: str,
     description: str,
