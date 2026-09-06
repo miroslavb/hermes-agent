@@ -1534,6 +1534,13 @@ def resolve_display_context_length(
     honored — this closes #15779 where ``/model`` switch ignored user-set
     overrides.
 
+    A profile-owned large-context policy remains in effect for a session-only
+    switch between compatible Codex large-context models.  The switch has not
+    changed the profile's Codex route, and the app-server will receive that
+    launch policy; discarding it here would display the catalogue's stale
+    272K advertisement instead.  Other providers and non-eligible Codex
+    models still discard a pin that belongs to a different route.
+
     Prefer the provider-aware value; fall back to ``model_info.context_window``
     only if the resolver returns nothing.
     """
@@ -1543,14 +1550,26 @@ def resolve_display_context_length(
         try:
             from hermes_cli.route_identity import should_clear_context_pin
 
-            if should_clear_context_pin(
+            clear_context_pin = should_clear_context_pin(
                 configured_model,
                 model,
                 configured_base_url,
                 base_url,
                 configured_provider,
                 provider,
-            ):
+            )
+            preserve_codex_large_context_policy = False
+            if clear_context_pin:
+                configured_codex = str(configured_provider or "").strip().lower()
+                target_codex = str(provider or "").strip().lower()
+                if (
+                    configured_codex == target_codex == "openai-codex"
+                    and int(config_context_length) > 272_000
+                ):
+                    from agent.model_metadata import is_codex_900k_base
+
+                    preserve_codex_large_context_policy = is_codex_900k_base(model)
+            if clear_context_pin and not preserve_codex_large_context_policy:
                 config_context_length = None
         except Exception:
             config_context_length = None

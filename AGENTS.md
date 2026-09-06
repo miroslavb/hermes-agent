@@ -1612,6 +1612,13 @@ remain available only when context policy is not pinned. The combined
 regression contour lives in
 `tests/run_agent/test_codex_app_server_integration.py`.
 
+The `/model` confirmation must retain that profile-owned large-context policy
+for a session-only switch between compatible `openai-codex` models, such as
+gpt-6-astra to gpt-5.6-terra. Do not display Codex's 272K catalogue
+advertisement in that case: it is not the selected app-server launch policy.
+Other providers and Codex models without a verified large-context path must
+continue to resolve their own context limit.
+
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
 unused module into a live code path, E2E test the real resolution chain

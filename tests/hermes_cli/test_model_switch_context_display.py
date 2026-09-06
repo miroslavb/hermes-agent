@@ -58,6 +58,27 @@ class TestResolveDisplayContextLength:
             )
         assert ctx == 128_000
 
+    def test_codex_large_context_policy_survives_session_switch(self):
+        """A profile pin remains the display policy for a compatible Codex switch.
+
+        The Codex catalogue advertises 272K for gpt-5.6-terra and
+        gpt-5.6-sol, but this profile explicitly launches compatible Codex
+        models with its 1M context policy.  A session-only switch from Astra
+        must not make the Telegram confirmation regress to the catalogue
+        advertisement.
+        """
+        for model in ("gpt-5.6-terra", "gpt-5.6-sol"):
+            ctx = resolve_display_context_length(
+                model,
+                "openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                config_context_length=1_000_000,
+                configured_model="gpt-6-astra",
+                configured_provider="openai-codex",
+                configured_base_url="https://chatgpt.com/backend-api/codex",
+            )
+            assert ctx == 1_000_000
+
     def test_custom_providers_override_honored(self):
         """Regression for #15779: /model switch onto a custom provider must
         surface the configured per-model context_length, not the 128K/256K
@@ -90,6 +111,4 @@ class TestResolveDisplayContextLength:
             "custom_providers[].models.gpt-5.5.context_length=1.05M must win "
             "over probe-down fallback"
         )
-
-
 
