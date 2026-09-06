@@ -849,3 +849,26 @@ class TestLegacyHiddenPlaceholderWireSubstitution:
         wire = agent.client.chat.completions.create.call_args.kwargs["messages"]
         wire_assistants = [m for m in wire if m.get("role") == "assistant"]
         assert wire_assistants[0]["content"] == "visible text"
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_codex_steer_uses_native_active_turn_and_preserves_rejection(accepted):
+    from unittest.mock import Mock
+    from types import SimpleNamespace
+    agent = _bare_agent()
+    agent.api_mode = "codex_app_server"
+    native = Mock(return_value=accepted)
+    agent._codex_session = SimpleNamespace(request_steer=native)
+    assert agent.steer("follow this correction") is accepted
+    native.assert_called_once_with("follow this correction")
+    assert agent._pending_steer is None
+    assert not agent._interrupt_requested
+
+
+def test_codex_steer_without_session_rejects_even_during_tools():
+    agent = _bare_agent()
+    agent.api_mode = "codex_app_server"
+    agent._codex_session = None
+    agent._executing_tools = True
+    assert agent.steer("keep this queued") is False
+    assert agent._pending_steer is None

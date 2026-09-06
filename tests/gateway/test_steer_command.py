@@ -171,3 +171,30 @@ async def test_steer_agent_without_steer_method_falls_back():
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_gateway_steer_reaches_codex_protocol_with_real_agent():
+    from run_agent import AIAgent
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+    agent = object.__new__(AIAgent)
+    agent.api_mode = "codex_app_server"
+    agent._interrupt_requested = False
+    agent._pending_steer = None
+    session = CodexAppServerSession(cwd="/tmp")
+    client = MagicMock()
+    client.request.return_value = {"turnId": "active-turn"}
+    session._client = client
+    session._thread_id = "thread"
+    session._active_turn_id = "active-turn"
+    agent._codex_session = session
+    runner, adapter = _make_runner(_session_entry())
+    key = build_session_key(_make_source())
+    runner._running_agents[key] = agent
+    result = await runner._busy_steer_command(_make_event("/steer use new scope"), key, _make_source())
+    client.request.assert_called_once_with("turn/steer", {
+        "threadId": "thread", "expectedTurnId": "active-turn",
+        "input": [{"type": "text", "text": "use new scope"}],
+    }, timeout=10)
+    assert agent._pending_steer is None
+    assert not agent._interrupt_requested

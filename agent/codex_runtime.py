@@ -892,6 +892,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(note, dict):
             return
         method = note.get("method") or ""
+        # The transport filters foreign thread/turn notifications before this
+        # callback. Stamp real provider progress independently of UI settings;
+        # otherwise the outer lease watchdog only sees "starting new turn".
+        touch = getattr(agent, "_touch_activity", None)
+        if method and callable(touch):
+            try:
+                touch(f"codex app-server: {method}")
+            except Exception:
+                logger.debug("Codex activity projection failed", exc_info=True)
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}

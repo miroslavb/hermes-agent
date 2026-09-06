@@ -106,3 +106,22 @@ def test_failed_command_result_and_error_flag_are_preserved():
 
 
 
+
+
+def test_codex_progress_updates_real_activity_clock_without_display():
+    from run_agent import AIAgent
+    agent = object.__new__(AIAgent)
+    agent._last_activity_ts = 1.0
+    bridge = make_codex_app_server_event_bridge(agent)
+    # Deltas and tools must both refresh the clock even with no UI callbacks.
+    notes = [
+        {"method": "item/reasoning/delta", "params": {"delta": "thinking"}},
+        {"method": "item/started", "params": {"item": {"type": "commandExecution", "id": "c", "command": "true"}}},
+        {"method": "item/commandExecution/outputDelta", "params": {"delta": "progress"}},
+        {"method": "item/completed", "params": {"item": {"type": "commandExecution", "id": "c", "exitCode": 0}}},
+    ]
+    for note in notes:
+        before = getattr(agent, "_turn_liveness_activity_generation", 0)
+        bridge(note)
+        assert agent._turn_liveness_activity_generation > before
+        assert agent._last_activity_ts > 1.0

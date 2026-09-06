@@ -3926,6 +3926,11 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        # Codex owns the tool loop; the Hermes tool-result queue is never
+        # drained there. Preserve native acceptance so callers can queue a
+        # correction when its active turn has already ended.
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            return self.redirect(cleaned)
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3977,6 +3982,7 @@ class AIAgent:
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
+            return False
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
