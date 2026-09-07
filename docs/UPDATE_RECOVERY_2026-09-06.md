@@ -15,7 +15,19 @@ correct. The dirty-tree gate runs before that strategy; changing to main or
 bypassing the guard would not be a safe repair. Keep the maintained branch and
 all local committed fixes, preserve uncommitted work before integrating upstream.
 
-## Current recovery status — owner-authorized retry, 2026-09-07
+## Current recovery status — activated 2026-09-07 02:07 UTC
+
+Обновление Hermes 0.21.0 активировано на коммите 1792e07e3a51c722fd265b0013998cab2b7dceff; живая проверка подтверждений в Telegram после обновления ещё не завершена. Активация подтверждена 2026-09-07 в 02:07 UTC: PID2742508/start115184664, Telegram connected от этого writer, maintained branch `fix/codex-context-continuity-20260829`. Последующий documentation-only commit не меняет startup code stamp и не требует перезапуска. [Source: /root/.local/state/hermes-update-repair-20260906/activation-20260907/activation-status.json; live systemd/proc/Git readback, 2026-09-07]
+
+CLI и gateway используют `.hermes-runtime/venv-update-20260907`, editable source — production. Проверены Python3.11.15/SQLite3.53.1 и 152 совместимых пакета; прежние shared venv сохранены. Реальный model+terminal canary после установки вернул HERMES_UPDATE_NATIVE_OK: api_mode=codex_responses, nested Codex session=false. Подтверждены compression.threshold=0.75, approvals.mode=manual/timeout900/cron_mode=deny; вложенный Codex не включался. [Source: activation-20260907/postactivation-direct-runtime.log; direct-runtime-receipt.json; CLI/uv/config/import readback, 2026-09-07]
+
+Повторный committed-tree прогон: 59 файлов/917 passed/0 failed; TUI/web собраны и чистая offline-установка этих workspace проверена до финальной остановки gateway. Исполняемый код совпадает с e6761a8045, включая чувствительные absolute-home redirects и binding native approval к request/chat/message/choice. Финальная версия installer прошла 18 ad-hoc guard/retry тестов. Полный broad suite не green и не объявляется принятой полной проверкой. Все 7 профильных backup-каталогов последней активации проверены: SQLite quick_check=ok и приватные режимы файлов. [Source: activation-20260907/retry-committed-tests.log; ui-preflight-receipt.json; postactivation-verification.json; real ad-hoc pytest result, 2026-09-07]
+
+История попыток: ожидание закончилось без установки в01:29; два последующих rollback сохранили прежний source/runtime. Исправлены критерий остановки (inactive/failed разрешены только при MainPID0 и пустом cgroup), scoped npm install для ui-tui/web вместо Electron/Desktop, возврат на maintained branch и уникальный backup-каталог каждой попытки. Предыдущие receipts/backups сохранены. Новый запуск существующего installer после успеха не разрешён автоматически: pins относятся к историческому preactivation PID/HEAD. [Source: activation-20260907/activation-attempt1-timeout-status.json; activation-attempt2-stop-rollback.json; activation-attempt3-ui-rollback.json; activate_when_idle.py, 2026-09-07]
+
+Следующий шаг — пользовательский Telegram turn, безвредный tool и native approve/deny round-trip с проверкой единственной доставки и продолжения сессии. В startup остаются подтверждённые на старом gateway предупреждения/ошибки duplicate Home Assistant credential и MCP Notion/AskChem/GBrain reconnect; это не объявлено исправленным обновлением. Новых ERROR/CRITICAL в bounded post-start review не выявлено. [Source: activation-20260907/postactivation-verification.json; old/new PID-scoped journal comparison, 2026-09-07]
+
+## Historical owner-authorized retry preparation — 2026-09-07
 
 The owner explicitly requested «Запускай» after the idle-wait timeout was
 reported. The newer documentation-only production commit
