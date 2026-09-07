@@ -390,8 +390,8 @@ class TestRunConversationCodexPath:
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures
-        the request_routing passed at construction time, so we can assert how
-        the gateway-context approval routing was resolved."""
+        the handler passed at construction and exercises it on a request.
+        Bypass decisions belong to request time, not transport creation."""
         captured: dict = {}
 
         def fake_init(self, **kwargs):
@@ -399,6 +399,9 @@ class TestRunConversationCodexPath:
             self._thread_id = "thread-stub-1"
 
         def fake_run_turn(self, user_input: str, **kwargs):
+            captured["decision"] = captured["approval_callback"](
+                "true", "runtime approval test", allow_permanent=False
+            )
             return TurnResult(
                 final_text="ok",
                 projected_messages=[{"role": "assistant", "content": "ok"}],
@@ -412,6 +415,30 @@ class TestRunConversationCodexPath:
             CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
         )
         return captured
+
+    def test_gateway_codex_request_has_a_live_approval_callback(self, monkeypatch):
+        import tools.approval as approval
+        from tools import approval_context
+        import tools.terminal_tool as terminal
+
+        captured = self._capture_routing_agent(monkeypatch)
+        monkeypatch.setattr(terminal, "_get_approval_callback", lambda: None)
+        monkeypatch.setattr(approval, "is_approval_bypass_active", lambda: False)
+        key = "test:codex:telegram:approval"
+        token = approval_context.set_current_session_key(key)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        approval.register_gateway_notify(key, lambda data: approval.resolve_gateway_approval(
+            key, "once", request_id=data["request_id"]
+        ))
+        try:
+            agent = _make_codex_agent()
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                agent.run_conversation("request approval")
+            assert callable(captured["approval_callback"])
+            assert captured["decision"] == "once"
+        finally:
+            approval.unregister_gateway_notify(key)
+            approval_context.reset_current_session_key(token)
 
     def test_approvals_mode_off_auto_approves_codex_server_requests(
         self, monkeypatch
@@ -431,8 +458,9 @@ class TestRunConversationCodexPath:
             ):
                 agent.run_conversation("write something")
         routing = captured["request_routing"]
-        assert routing.auto_approve_exec is True
-        assert routing.auto_approve_apply_patch is True
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+        assert captured["decision"] == "once"
 
     def test_yaml_boolean_false_approval_mode_also_auto_approves(
         self, monkeypatch
@@ -450,14 +478,14 @@ class TestRunConversationCodexPath:
             ):
                 agent.run_conversation("write something")
         routing = captured["request_routing"]
-        assert routing.auto_approve_exec is True
-        assert routing.auto_approve_apply_patch is True
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+        assert captured["decision"] == "once"
 
     def test_manual_approvals_keep_codex_server_requests_fail_closed(
         self, monkeypatch
     ):
-        """Default (manual) approvals must preserve the fail-closed behavior —
-        this fix is a no-op for users who haven't opted out."""
+        """Manual approvals without a registered UI must fail closed."""
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
@@ -471,6 +499,7 @@ class TestRunConversationCodexPath:
         routing = captured["request_routing"]
         assert routing.auto_approve_exec is False
         assert routing.auto_approve_apply_patch is False
+        assert captured["decision"] == "deny"
 
     def test_frozen_yolo_env_auto_approves_codex_server_requests(
         self, monkeypatch
@@ -493,14 +522,15 @@ class TestRunConversationCodexPath:
             ):
                 agent.run_conversation("write something")
         routing = captured["request_routing"]
-        assert routing.auto_approve_exec is True
-        assert routing.auto_approve_apply_patch is True
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+        assert captured["decision"] == "once"
 
     def test_session_yolo_auto_approves_codex_server_requests(
         self, monkeypatch
     ):
-        """The /yolo session toggle should be honored at Codex session creation
-        time, independent of the startup-time approvals config."""
+        """The /yolo session toggle should be honored when the runtime request
+        is handled, independent of the startup-time approvals config."""
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
@@ -515,8 +545,9 @@ class TestRunConversationCodexPath:
             ):
                 agent.run_conversation("write something")
         routing = captured["request_routing"]
-        assert routing.auto_approve_exec is True
-        assert routing.auto_approve_apply_patch is True
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+        assert captured["decision"] == "once"
 
 
 class TestReviewForkApiModeDowngrade:

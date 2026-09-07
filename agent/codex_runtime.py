@@ -638,19 +638,8 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]]) -> None:
         return
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
-    # Approval callback: Hermes' standard prompt flow when a CLI thread installed one.
-    approval_callback = None
-    with suppress(Exception):
-        from tools.terminal_tool import _get_approval_callback
-        approval_callback = _get_approval_callback()
-    # Gateway/cron have no UI for codex approval requests, so exec/apply_patch fail closed by default. Only an
-    # explicit approval bypass (approvals.mode: off, /yolo, --yolo, HERMES_YOLO_MODE) hands policy to codex's sandbox.
-    auto_approve_requests = False
-    try:
-        from tools.approval import is_approval_bypass_active
-        auto_approve_requests = is_approval_bypass_active()
-    except Exception:
-        logger.debug("codex app-server: approval-bypass lookup failed; keeping fail-closed default", exc_info=True)
+    # Resolve the current Hermes UI and approval mode on each request.
+    from tools.approval import request_runtime_approval
     # Bridge codex JSON-RPC notifications (item/started, item/completed, item/agentMessage/delta, ...) into
     # Hermes' gateway UI callbacks (tool_progress_callback, _fire_stream_delta,
     # _emit_interim_assistant_message). Without this, Discord/Telegram users see no live tool-progress or
@@ -672,11 +661,8 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]]) -> None:
             messages,
             effective_context_window,
         ),
-        approval_callback=approval_callback,
-        request_routing=_ServerRequestRouting(
-            auto_approve_exec=auto_approve_requests,
-            auto_approve_apply_patch=auto_approve_requests,
-        ),
+        approval_callback=request_runtime_approval,
+        request_routing=_ServerRequestRouting(),
         on_event=make_codex_app_server_event_bridge(agent),
     )
 

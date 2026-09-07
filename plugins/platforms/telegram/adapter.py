@@ -512,7 +512,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._max_doc_bytes: int = 2 * 1024 * 1024 * 1024 if extra.get("base_url") else 20 * 1024 * 1024
         self._model_picker_state: Dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: Dict[str, dict] = {}
-        self._approval_state: Dict[int, str] = {}  # message_id → session_key
+        self._approval_state: Dict[int, Dict[str, Any]] = {}  # approval_id → exact request binding
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
         # "important" (default): only final responses, approvals and slash confirmations notify;
@@ -3792,8 +3792,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 if allow_permanent:
                     buttons.append(InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}"))
             buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
-            return text, InlineKeyboardMarkup(
-                self._rows_of_two(buttons)), lambda msg: self._approval_state.__setitem__(approval_id, session_key)
+            def on_sent(msg):
+                self._approval_state[approval_id] = {
+                    "session_key": session_key,
+                    "request_id": (metadata or {}).get("approval_request_id"),
+                    "chat_id": str(normalize_telegram_chat_id(chat_id)),
+                    "message_id": str(msg.message_id),
+                    "choices": {"once", "deny"} | (
+                        ({"session", "always"} if allow_permanent else {"session"})
+                        if allow_session and not smart_denied else set()
+                    ),
+                }
+            return text, InlineKeyboardMarkup(self._rows_of_two(buttons)), on_sent
         return await self._send_prompt(
             "send_exec_approval", chat_id, metadata, build, parse_mode=ParseMode.HTML,
             thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
@@ -4262,11 +4272,20 @@ class TelegramAdapter(BasePlatformAdapter):
         except (ValueError, IndexError):
             await query.answer(text="Invalid approval data.")
             return
-        session_key = await self._claim_callback_state(
-            query, cb, self._approval_state, approval_id, "⛔ You are not authorized to approve commands.",
-            "This approval has already been resolved.")
-        if not session_key:
+        if not await self._callback_authorized(query, cb, "⛔ You are not authorized to approve commands."):
             return
+        binding = self._approval_state.get(approval_id)
+        if not isinstance(binding, dict) or not binding.get("request_id"):
+            self._approval_state.pop(approval_id, None)
+            await query.answer(text="This approval has expired or already been resolved.")
+            return
+        if (str(cb["chat_id"]) != binding["chat_id"]
+                or str(getattr(query.message, "message_id", "")) != binding["message_id"]
+                or choice not in binding["choices"]):
+            await query.answer(text="This button does not match the approval request.")
+            return
+        self._approval_state.pop(approval_id, None)
+        session_key = binding["session_key"]
         user_display = getattr(query.from_user, "first_name", "User")
         # Resolve FIRST (unblocks the agent thread), render after: a tap landing after the wait timed out
         # (count == 0) must NOT claim "Approved" — the command was already denied.
@@ -4275,7 +4294,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # the approval wait timed out (count == 0) must NOT claim "Approved" — the command was already
             # denied and will not run (#63501 regression follow-up: 60s waits made stale taps common).
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(session_key, choice, request_id=binding["request_id"])
             logger.info(
                 "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)", count, session_key, choice, user_display)
         except Exception as exc:
