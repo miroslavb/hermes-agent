@@ -518,7 +518,7 @@ See docs/UPDATE_RECOVERY_2026-09-06.md for primary logs and recovery state.
 
 По отдельному указанию пользователя `compression.threshold=0.75` сохранён в default profile. Новый агент читает 75%; уже созданный CLI agent может сохранять прежний порог. [Source: User and config readback, 2026-09-07]
 
-Активация пока ожидает простоя gateway: другой Telegram-ход не прерывать. Проверенный candidate `.hermes-runtime/venv-update-20260907` использует Python3.11.15/SQLite3.53.1 и совместимые зависимости; существующие shared venv не менять. После активации нужны свежие PID/code stamp/Telegram evidence и реальный approval round-trip. Старый broad suite не green и не объявляется принятой полной проверкой. [Source: docs/UPDATE_RECOVERY_2026-09-06.md; gateway readback, 2026-09-07]
+Первая активация остановилась 2026-09-07 в 01:29 UTC по лимиту ожидания без изменения production. После освобождения gateway владелец явно разрешил новый запуск; документационный production-коммит f30be09fd1 объединён с проверенным candidate e6761a8045 без изменения исполняемого кода. Для новой попытки переустановить точные OLD/NEW pins и повторить preflight; занятый gateway не прерывать. Проверенный candidate `.hermes-runtime/venv-update-20260907` использует Python3.11.15/SQLite3.53.1 и совместимые зависимости; существующие shared venv не менять. После активации нужны свежие PID/code stamp/Telegram evidence и реальный approval round-trip. Старый broad suite не green и не объявляется принятой полной проверкой. [Source: docs/UPDATE_RECOVERY_2026-09-06.md; gateway readback, 2026-09-07]
 
 ## Codex progress and steering incident — 2026-09-06
 
