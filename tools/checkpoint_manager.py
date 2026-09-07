@@ -233,6 +233,11 @@ def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT
         logger.error("Git command skipped: %s (%s)", " ".join(cmd), msg)
         return False, "", msg
 
+    # A prior process/external gc may have left only packed refs. Repair the
+    # empty skeleton before use, not merely after this process's own gc.
+    # Never initialize a missing store or rewrite HEAD, objects or packed refs.
+    if _store_has_head(store) and (store / "objects").is_dir():
+        _repair_bare_repo_dirs(store)
     try:
         result = _git_subprocess(cmd, _git_env(store, str(wd), index_file=index_file), timeout, cwd=str(wd))
     except subprocess.TimeoutExpired:

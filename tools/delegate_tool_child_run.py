@@ -562,6 +562,7 @@ class _ChildRun:
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
+    _close_deferred: bool = False  # survives a BaseException that prevents tuple assignment by the caller
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -633,8 +634,10 @@ class _ChildRun:
         """Run the child's conversation on a daemon worker: ``(result, None, False)`` or ``(None, error_entry,
         close_deferred)`` on timeout/exception.
 
-        Hard timeout is off by default (``result(timeout=None)``; stuck children are the heartbeat's job). Daemon
-        worker: an abandoned timed-out child on a non-daemon thread would block interpreter exit at atexit join. The
+        Configured execution time excludes this child's bounded human-approval waits;
+        nonhuman work remains deadline-bounded. The cap is off by default (stuck
+        children are the heartbeat's job). Daemon workers do not block interpreter
+        exit if a timed-out child abandons blocking I/O. The
         worker installs a non-interactive approval callback (deny/approve per delegation.subagent_auto_approve) so
         dangerous-command prompts never fall back to ``input()`` and deadlock the parent TUI. On failure: steer
         acceptance closes BEFORE the stop signal (a concurrent steer is drained into the entry or rejected, never
@@ -660,18 +663,46 @@ class _ChildRun:
                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
 
-        future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
-        try:
-            return future.result(timeout=child_timeout), None, False
-        except Exception as wait_exc:
-            exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
-        finally:
-            # Shut down without waiting — a child stuck on blocking I/O would hang wait=True forever.
-            executor.shutdown(wait=False)
+        from tools.approval_human_wait import human_wait_scope, human_wait_seconds
+        with human_wait_scope() as wait_key:
+            started = time.monotonic()
+            deadline_expired = False
+            future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+            try:
+                if child_timeout is None:
+                    return future.result(), None, False
+                while True:
+                    # Only the child's measured, bounded HUMAN wait is excluded;
+                    # slow model/tool work and sibling approvals still cost time.
+                    remaining = child_timeout - (time.monotonic() - started - human_wait_seconds(wait_key))
+                    try:
+                        return future.result(timeout=max(0.0, min(1.0, remaining))), None, False
+                    except FuturesTimeoutError:
+                        if future.done():
+                            # TimeoutError from the provider/worker is not our deadline.
+                            raise
+                        if remaining <= 0:
+                            deadline_expired = True
+                            raise
+            except Exception as wait_exc:
+                exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
+            except BaseException:
+                # Owner cancellation must not orphan an executing child. Preserve
+                # the original cancellation, but stop tools and close only after
+                # the worker settles; cleanup() also sees this deferred ownership.
+                self.close_steering()
+                _signal_child_stop(child)
+                if not future.done():
+                    self._close_deferred = True
+                    _defer_close_after_timeout(child, future)
+                raise
+            finally:
+                # A child stuck on blocking I/O must not hang shutdown forever.
+                executor.shutdown(wait=False)
 
         _late_pending_steer = self.close_steering()
         _signal_child_stop(child)
-        is_timeout = isinstance(exc, (FuturesTimeoutError, TimeoutError))
+        is_timeout = deadline_expired
         duration = self.elapsed()
         logger.warning("Subagent %d %s after %.1fs", task_index, "timed out" if is_timeout else f"raised {type(exc).__name__}", duration)
         child_api_calls = 0
@@ -800,7 +831,7 @@ class _ChildRun:
 
         # Close tool resources (terminal sandboxes, browser daemons, background
         # processes, httpx clients) so subagent subprocesses don't outlive the delegation.
-        if not close_deferred:
+        if not (close_deferred or self._close_deferred):
             _close_child(child, "Failed to close child agent after delegation")
 
         # The AIAgent turn boundary normally closes the child scope itself. This fallback covers failures before that

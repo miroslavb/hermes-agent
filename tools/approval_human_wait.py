@@ -13,8 +13,10 @@ state, bounded by _HUMAN_WAIT_MAX_SESSIONS.
 """
 
 import contextlib
+from contextvars import ContextVar
 import threading
 import time
+import uuid
 
 
 # ========================================================================= Human-wait accounting (per
@@ -39,6 +41,7 @@ class _HumanWaitState:
 _human_wait_lock = threading.Lock()
 _human_wait_states: dict[str, _HumanWaitState] = {}
 _HUMAN_WAIT_MAX_SESSIONS = 256
+_human_wait_scopes: ContextVar[tuple[str, ...]] = ContextVar("hermes_human_wait_scopes", default=())
 # Margin added on top of approvals.timeout when clamping a window's contribution (read-side AND close-side) and when
 # bounding the authorization gate's serialization-lock acquire in agent/tool_executor.py. One constant so the clamps
 # can't drift apart.
@@ -105,6 +108,22 @@ def activity_heartbeat(label: str):
 
 
 @contextlib.contextmanager
+def human_wait_scope():
+    """Isolate a deadline owner's human time from sibling work in the same chat.
+
+    Context propagation carries the owner through delegated/tool worker threads.
+    Nested owners also accrue the enclosing child's real human wait, while an
+    unrelated child sharing the gateway session does not extend this deadline.
+    """
+    key = "deadline-owner:" + uuid.uuid4().hex
+    token = _human_wait_scopes.set((*_human_wait_scopes.get(), key))
+    try:
+        yield key
+    finally:
+        _human_wait_scopes.reset(token)
+
+
+@contextlib.contextmanager
 def human_wait_window(session_key: str | None = None):
     """Mark the enclosed block as time spent blocked on a human prompt. Wrap ONLY
     code that is genuinely parked waiting for a user's answer (the CLI approval
@@ -116,13 +135,14 @@ def human_wait_window(session_key: str | None = None):
 
     See #79719.
     """
-    key = _resolve_key(session_key)
+    keys = tuple(dict.fromkeys((_resolve_key(session_key), *_human_wait_scopes.get())))
     now = time.monotonic()
     with _human_wait_lock:
-        state = _human_wait_state(key)
-        if state.pending == 0:
-            state.window_started = now
-        state.pending += 1
+        for key in keys:
+            state = _human_wait_state(key)
+            if state.pending == 0:
+                state.window_started = now
+            state.pending += 1
     try:
         yield
     finally:
@@ -131,13 +151,14 @@ def human_wait_window(session_key: str | None = None):
         # record at most the ceiling, not the whole overstay.
         ceiling = human_wait_ceiling()
         with _human_wait_lock:
-            state = _human_wait_states.get(key)
-            if state is not None:
-                state.pending -= 1
-                if state.pending == 0:
-                    if state.window_started is not None:
-                        state.completed_seconds += _clamped_window_seconds(state.window_started, now, ceiling)
-                    state.window_started = None
+            for key in keys:
+                state = _human_wait_states.get(key)
+                if state is not None:
+                    state.pending -= 1
+                    if state.pending == 0:
+                        if state.window_started is not None:
+                            state.completed_seconds += _clamped_window_seconds(state.window_started, now, ceiling)
+                        state.window_started = None
 
 
 def human_wait_seconds(session_key: str | None = None) -> float:
