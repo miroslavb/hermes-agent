@@ -7,6 +7,14 @@ The default profile now uses `model.openai_runtime: auto`. With the configured
 `codex_responses` path: Hermes owns the agent loop and tools. Codex app-server
 is retained only as an opt-in runtime.
 
+On 2026-09-07 the operator clarified that nested Codex is unnecessary for this
+Telegram workflow. Do not enable it or require its activation/acceptance to finish
+the Hermes update. `openai-codex`/`codex_responses` names the direct provider/API
+path, not an app-server subprocess. Preserve the shared Telegram approval-button
+request/chat/message binding independently from optional runtime code; this
+clarification does not authorize removing committed code or credentials.
+[Source: User correction and readonly config/runtime resolver, 2026-09-07]
+
 The direct OpenAI smoke returned `HERMES_DIRECT_OK` at
 2026-09-06 22:28:39 UTC. The gateway entered its new process at 22:33:11 UTC,
 and a later Telegram session was observed in `agent.conversation_loop` without
