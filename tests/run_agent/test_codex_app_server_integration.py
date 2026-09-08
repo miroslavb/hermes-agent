@@ -946,9 +946,10 @@ class TestCodexContextContinuity:
     """Regression contour for context lost after app-server retirement."""
 
     def test_large_context_profile_is_forwarded_to_app_server(self):
-        assert _codex_app_server_launch_args("gpt-6-astra", 1_000_000) == [
+        # Exercise an unknown future model independently of the live catalog.
+        assert _codex_app_server_launch_args("test-future-model", 1_000_000) == [
             "-c",
-            'model="gpt-6-astra"',
+            'model="test-future-model"',
             "-c",
             "model_context_window=1000000",
             "-c",
@@ -1127,10 +1128,10 @@ class TestCodexContextContinuity:
             _Session,
         )
         db = _ThreadStateDB(
-            {"thread_id": "thread-old", "model": "gpt-6-astra"}
+            {"thread_id": "thread-old", "model": "test-future-model"}
         )
         agent = _continuity_agent(
-            model="gpt-6-astra",
+            model="test-future-model",
             _session_db=db,
             _codex_session=None,
             _config_context_length=1_000_000,

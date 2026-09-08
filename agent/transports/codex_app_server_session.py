@@ -47,6 +47,8 @@ class TurnResult:
     error: Optional[str] = None  # non-recoverable turn error
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
+    # Exact turn/start text distinguishes the input echo from a new user event.
+    submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
@@ -416,6 +418,7 @@ class CodexAppServerSession:
                         "[Current user turn]\n"
                         f"{user_input_text}"
                     )
+                result.submitted_user_text = user_input_text
                 params = {
                     "threadId": self._thread_id,
                     "input": [{"type": "text", "text": user_input_text}],

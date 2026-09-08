@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -108,7 +108,10 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
     assert result is not None
     assert "steer" in result.lower() or "queued" in result.lower()
     # The agent's steer() was called with the payload (prefix stripped)
-    running_agent.steer.assert_called_once_with("also check auth.log")
+    running_agent.steer.assert_called_once()
+    injected = running_agent.steer.call_args.args[0]
+    assert injected.endswith("\n\nalso check auth.log")
+    assert '"chat_id": "c1"' in injected
     # Critically: interrupt was NOT called
     running_agent.interrupt.assert_not_called()
     # And no user-text queueing happened — the steer doesn't go into
@@ -137,7 +140,10 @@ async def test_steer_reaches_ancient_turn_via_fresh_timestamp_fallback(
 
     result = await runner._handle_message(_make_event("/steer pause safely"))
 
-    running_agent.steer.assert_called_once_with("pause safely")
+    running_agent.steer.assert_called_once()
+    injected = running_agent.steer.call_args.args[0]
+    assert injected.endswith("\n\npause safely")
+    assert '"chat_id": "c1"' in injected
     assert runner._running_agents[sk] is running_agent
     assert result is not None
 
@@ -192,9 +198,21 @@ async def test_gateway_steer_reaches_codex_protocol_with_real_agent():
     key = build_session_key(_make_source())
     runner._running_agents[key] = agent
     result = await runner._busy_steer_command(_make_event("/steer use new scope"), key, _make_source())
-    client.request.assert_called_once_with("turn/steer", {
-        "threadId": "thread", "expectedTurnId": "active-turn",
-        "input": [{"type": "text", "text": "use new scope"}],
-    }, timeout=10)
+    client.request.assert_called_once()
+    args, kwargs = client.request.call_args
+    assert args[0] == "turn/steer"
+    assert kwargs == {"timeout": 10}
+    payload = args[1]
+    assert payload["threadId"] == "thread"
+    assert payload["expectedTurnId"] == "active-turn"
+    assert len(payload["input"]) == 1
+    assert payload["input"][0]["type"] == "text"
+    text = payload["input"][0]["text"]
+    assert text.endswith("\n\nuse new scope")
+    import json
+    assert json.loads(text.splitlines()[1]) == {
+        "platform": "telegram", "chat_id": "c1", "chat_type": "dm",
+        "user_id": "u1", "message_id": "m1",
+    }
     assert agent._pending_steer is None
     assert not agent._interrupt_requested
