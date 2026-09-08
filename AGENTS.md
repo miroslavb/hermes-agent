@@ -540,6 +540,16 @@ rule must not be widened to unknown source files. Preserve the dirty-tree guard
 and `parked_branch_strategy: update_in_place`. See `docs/UPDATE_HYGIENE.md` for
 reproduction, private preservation and update acceptance boundaries.
 
+Verified 2026-09-08 23:07UTC: upstream0.21.1 integrated with local patches at
+code d93b22cc4c; fresh native update receipt reports success/exit0/skips[]. Final
+gateway501686 (23:05:58UTC) and dashboard498443 use the isolated
+`.hermes-runtime/venv-update-20260908`; Telegram/mainHA connected and direct
+model+terminal smoke passed. Seven consistent profile backups retained;
+230 integration +47 workspace/update tests passed. Keep manual900s/child600s;
+no full-suite or human approval-button claim. Do not rerun the spent pinned
+activation script. [Source: docs/UPDATE_HYGIENE.md; native update receipt
+update_20260908_230558_500563.json; live readback, 2026-09-08]
+
 ## Codex progress and steering incident — 2026-09-06
 
 2026-09-06: подтверждён ложный abort Codex-хода через 600 секунд (last activity: starting new turn), потому что app-server event bridge не обновлял AIAgent activity clock. Исправлен bridge: реальные события обновляют _touch_activity независимо от UI. AIAgent.steer теперь направляет Codex-коррекции в native turn/steer, а rejection/no session возвращает False для очереди gateway. В default config agent.turn_liveness.timeout_s=0; настройка проверена через реальный resolver. 121 связанных тестов прошли; дополнительная gateway→AIAgent→Codex-session→protocol проверка прошла в наборе из 6 тестов. systemctl reload запросил штатный restart после активного хода; новый PID и живая доставка steering в Telegram пока не проверены. Не считать патч активированным до смены PID. Следующий шаг после завершения этого хода: проверить новый gateway PID и доставку коррекции во время живого хода.
