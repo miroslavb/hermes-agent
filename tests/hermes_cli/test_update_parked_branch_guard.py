@@ -120,6 +120,26 @@ def test_untracked_file_blocks_auto_switch(repo_pair):
     assert reason == "dirty"
 
 
+def test_private_root_diagnostics_do_not_block_but_source_edits_do(repo_pair):
+    """Legacy private DM dumps stay out of Git; unknown work still blocks updates."""
+    from pathlib import Path
+
+    ignore = Path(__file__).resolve().parents[2] / ".gitignore"
+    (repo_pair / ".gitignore").write_bytes(ignore.read_bytes())
+    _git(repo_pair, "add", ".gitignore")
+    _git(repo_pair, "commit", "-qm", "install artifact policy")
+    artifact = repo_pair / "telegram_dm_snapshot_20990101_000000.json"
+    artifact.write_text('{"synthetic": true}\n')
+    assert _git(repo_pair, "check-ignore", artifact.name, check=False).returncode == 0
+    assert update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    )[0] is True
+    (repo_pair / "scratch.py").write_text("# unfinished source\n")
+    assert update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    ) == (False, "dirty")
+
+
 def test_unmerged_commits_switch_with_kept_notice(repo_pair):
     """Commits on the parked branch not in origin/main: still safe to switch
     (checkout keeps them on the branch) — reason carries the count so the

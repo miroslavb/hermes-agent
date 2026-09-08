@@ -226,3 +226,5 @@ native/fts5_cjk/*.so
 
 # Local runtime receipts and camera captures are not source inputs.
 evidence/
+# Legacy private DM diagnostics must never enter update autostashes or commits.
+/telegram_dm_snapshot_*.json
