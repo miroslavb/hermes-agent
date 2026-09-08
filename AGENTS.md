@@ -530,6 +530,16 @@ CLI и gateway используют `.hermes-runtime/venv-update-20260907`, edit
 
 Keep approvals manual/900s and the child's600s execution budget; exclude only owner-scoped bounded human waits. Checkpoint recovery preserved213original files and passed safe snapshot/restore; the final preactivation regression was69files/1110passed, not a full broad-suite claim. HAtools/voice services and secrets remain intact; only duplicate event adapters are disabled. Next optional acceptance is a real human Telegram approve/deny round-trip; it is not a prerequisite to the already-proven activation. Do not restart again for documentation-only updates. [Source: User; docs/OPS_REPAIR_2026-09-07.md; live postactivation receipt, 2026-09-07]
 
+## Maintained-install update hygiene
+
+Keep task diagnostics out of installed source. The default gateway profile uses
+explicit `terminal.cwd: /root`: a multiplex terminal scope drops placeholder `.`
+and otherwise the local tool falls back to the systemd installation cwd. Private
+DM dumps belong outside the checkout, mode0600; the root-only legacy dump ignore
+rule must not be widened to unknown source files. Preserve the dirty-tree guard
+and `parked_branch_strategy: update_in_place`. See `docs/UPDATE_HYGIENE.md` for
+reproduction, private preservation and update acceptance boundaries.
+
 ## Codex progress and steering incident — 2026-09-06
 
 2026-09-06: подтверждён ложный abort Codex-хода через 600 секунд (last activity: starting new turn), потому что app-server event bridge не обновлял AIAgent activity clock. Исправлен bridge: реальные события обновляют _touch_activity независимо от UI. AIAgent.steer теперь направляет Codex-коррекции в native turn/steer, а rejection/no session возвращает False для очереди gateway. В default config agent.turn_liveness.timeout_s=0; настройка проверена через реальный resolver. 121 связанных тестов прошли; дополнительная gateway→AIAgent→Codex-session→protocol проверка прошла в наборе из 6 тестов. systemctl reload запросил штатный restart после активного хода; новый PID и живая доставка steering в Telegram пока не проверены. Не считать патч активированным до смены PID. Следующий шаг после завершения этого хода: проверить новый gateway PID и доставку коррекции во время живого хода.
